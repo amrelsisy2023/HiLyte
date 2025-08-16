@@ -1,0 +1,5200 @@
+import type { Express, Request } from "express";
+import express from "express";
+import { createServer, type Server } from "http";
+
+// Extend Express Request interface to include authentication properties
+declare global {
+  namespace Express {
+    interface Request {
+      user?: any;
+      isAuthenticated?: () => boolean;
+    }
+  }
+}
+
+// Type declarations for modules without TypeScript definitions
+declare module 'speakeasy' {
+  export function generateSecret(options: any): any;
+  export function totp(options: any): string;
+  export function totp_verify(options: any): any;
+}
+
+declare module 'qrcode' {
+  export function toDataURL(text: string): Promise<string>;
+}
+
+import { storage } from "./simple-storage";
+import { seedSubscriptionPlans } from "./subscription-seeder";
+import Stripe from "stripe";
+import { extractionEngine } from "./extraction-engine";
+import { extractTextFromPDFRegion, isPDFTextBased, type ExtractedTable } from "./pdf-text-extractor";
+import { aiExtractionService } from "./ai-extraction-service";
+import { AITrainingService } from "./ai-training-service";
+import { AiCreditService } from "./ai-credit-service";
+import { extractAllSheetMetadata } from "./sheet-metadata-service";
+import { cleanupOldFiles } from "./upload-optimizer";
+import { ExtractionTemplateService, type ExtractionTemplate } from "./extraction-template-service";
+import { z } from "zod";
+import bcrypt from "bcryptjs";
+import speakeasy from "speakeasy";
+import QRCode from "qrcode";
+import { 
+  generateVerificationCode, 
+  storeVerificationCode, 
+  verifyCode,
+  sendSMSVerificationCode,
+  sendEmailVerificationCode
+} from './real-verification-service';
+import { errorLogger, errorLoggingMiddleware, requestLoggingMiddleware } from "./error-logger";
+import { betaFeedbackService } from "./beta-feedback-service";
+import { betaInvitationService } from "./beta-invitation-service";
+import { revisionComparisonService } from "./revision-comparison-service";
+import { generateIndustrySpecificColumns } from "./ai-template-service";
+import { insertWaitlistSchema, insertBetaInvitationSchema } from "@shared/schema";
+import { procurementAnalysisService, type ProcurementAnalysisResult } from "./procurement-analysis-service";
+
+import fs from "fs";
+import path from "path";
+
+const aiTrainingService = new AITrainingService();
+
+// Global upload status tracking
+let currentUploadStatus = {
+  phase: 'idle' as 'idle' | 'pdf_processing' | 'ai_extraction' | 'complete',
+  pagesProcessed: 0,
+  totalPages: 0,
+  currentTask: '',
+  fileName: ''
+};
+
+// Cancellation token to stop ongoing processing
+let uploadCancellationToken = { cancelled: false };
+
+// Background AI processing status
+let backgroundAiStatus = {
+  isProcessing: false,
+  drawingId: null as number | null,
+  currentPage: 0,
+  totalPages: 0,
+  fileName: ''
+};
+
+// Export functions to manage background AI status
+export function updateBackgroundAiStatus(updates: Partial<typeof backgroundAiStatus>) {
+  backgroundAiStatus = { ...backgroundAiStatus, ...updates };
+}
+
+export function getBackgroundAiStatus() {
+  return backgroundAiStatus;
+}
+
+// Helper function to format extracted tables for display
+function formatTableForDisplay(table: ExtractedTable): string {
+  const { headers, rows } = table;
+  
+  // Create a formatted table structure
+  let result = 'TABLE DETECTED\n\n';
+  
+  // Add headers
+  if (headers.length > 0) {
+    result += headers.join(' | ') + '\n';
+    result += headers.map(() => '---').join(' | ') + '\n';
+  }
+  
+  // Add rows
+  for (const row of rows) {
+    result += row.join(' | ') + '\n';
+  }
+  
+  result += `\nExtracted ${rows.length} rows with ${headers.length} columns (confidence: ${table.confidence.toFixed(2)})`;
+  
+  return result;
+}
+
+function formatStructuredData(headers: string[], rows: string[][], originalText: string): string {
+  if (headers.length === 0) {
+    return originalText;
+  }
+  
+  let result = `STRUCTURED DATA EXTRACTED\n\n`;
+  result += `Headers: ${headers.join(' | ')}\n`;
+  result += `Rows: ${rows.length}\n\n`;
+  
+  // Format as table
+  result += headers.join(' | ') + '\n';
+  result += headers.map(() => '---').join(' | ') + '\n';
+  
+  rows.forEach(row => {
+    // Ensure row has same number of columns as headers
+    const paddedRow = [...row];
+    while (paddedRow.length < headers.length) {
+      paddedRow.push('');
+    }
+    result += paddedRow.slice(0, headers.length).join(' | ') + '\n';
+  });
+  
+  result += '\n--- Original Text ---\n';
+  result += originalText;
+  
+  return result;
+}
+import { 
+  insertProjectSchema, 
+  insertDrawingSchema, 
+  insertExtractedDataSchema, 
+  insertConstructionDivisionSchema,
+  insertUserSchema,
+  loginSchema,
+  type LoginData
+} from "@shared/schema";
+import multer from "multer";
+import { processPDF, getImageDimensions } from "./pdf-processor";
+
+// Configure multer for file uploads
+const uploadsDir = path.join(process.cwd(), "uploads");
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+const storage_multer = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadsDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ 
+  storage: storage_multer,
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['image/png', 'image/jpeg', 'image/jpg', 'application/pdf'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only PNG, JPG, and PDF files are allowed.'));
+    }
+  }
+});
+
+// Initialize Stripe
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-07-30.basil",
+});
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Initialize subscription plans on startup
+  await seedSubscriptionPlans();
+  
+  // Add error and request logging middleware
+  app.use(requestLoggingMiddleware);
+  app.use(errorLoggingMiddleware);
+  
+  // Authentication routes
+
+  // Logout route to clear session
+  app.post('/api/auth/logout', (req: any, res) => {
+    req.session.destroy((err: any) => {
+      if (err) {
+        return res.status(500).json({ message: 'Failed to logout' });
+      }
+      res.clearCookie('connect.sid'); // Default session cookie name
+      res.json({ message: 'Logged out successfully' });
+    });
+  });
+
+  // Check current authentication status
+  app.get('/api/auth/status', (req: any, res) => {
+    if (req.isAuthenticated() && req.user) {
+      res.json({ authenticated: true, user: req.user });
+    } else {
+      res.json({ authenticated: false, user: null });
+    }
+  });
+
+  app.post('/api/auth/register', async (req, res) => {
+    try {
+      // Define a registration schema that accepts password instead of passwordHash
+      const registrationSchema = z.object({
+        email: z.string().email(),
+        firstName: z.string().min(1),
+        lastName: z.string().min(1),
+        company: z.string().min(1),
+        phoneNumber: z.string().min(1),
+        password: z.string().min(8),
+        confirmPassword: z.string().optional(), // Allow but ignore confirmPassword
+      });
+
+      const validatedData = registrationSchema.parse(req.body);
+      
+      // Check if user already exists
+      const existingUserByEmail = await storage.getUserByEmail(validatedData.email);
+      if (existingUserByEmail) {
+        return res.status(400).json({ message: 'Email already registered' });
+      }
+
+      // Generate username from email (part before @)
+      const generatedUsername = validatedData.email.split('@')[0];
+      
+      // Check if generated username already exists, if so, add a number
+      let username = generatedUsername;
+      let counter = 1;
+      while (await storage.getUserByUsername(username)) {
+        username = `${generatedUsername}${counter}`;
+        counter++;
+      }
+
+      // Generate 2FA secret for new user
+      const secret = speakeasy.generateSecret({
+        name: `Hi-LYTE (${validatedData.email})`,
+        issuer: 'Koncurent Hi-LYTE'
+      });
+
+      // Generate backup codes (8 random 6-digit codes)
+      const backupCodes = Array.from({ length: 8 }, () => 
+        Math.floor(100000 + Math.random() * 900000).toString()
+      );
+
+      const userData = {
+        email: validatedData.email,
+        username: username,
+        firstName: validatedData.firstName,
+        lastName: validatedData.lastName,
+        company: validatedData.company,
+        phoneNumber: validatedData.phoneNumber,
+        passwordHash: await bcrypt.hash(validatedData.password, 10), // Hash the password
+        twoFactorSecret: secret.base32,
+        twoFactorEnabled: false, // Will be enabled after verification
+        twoFactorBackupCodes: backupCodes
+      };
+
+      const user = await storage.createUser(userData);
+      
+      // Generate QR code for the secret
+      const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url || '');
+      
+      // Return user without password hash and with 2FA setup info
+      const { passwordHash: _, twoFactorSecret, twoFactorBackupCodes, ...userWithoutPassword } = user;
+      res.status(201).json({ 
+        user: userWithoutPassword,
+        twoFactorSetup: {
+          secret: secret.base32,
+          qrCode: qrCodeUrl,
+          backupCodes: backupCodes,
+          manualEntryKey: secret.base32
+        },
+        message: 'Registration successful - Please set up two-factor authentication'
+      });
+    } catch (error) {
+      console.error('Registration error:', error);
+      res.status(400).json({ message: 'Registration failed' });
+    }
+  });
+
+  // Setup 2FA with method selection
+  app.post('/api/auth/setup-2fa', async (req, res) => {
+    try {
+      const { userId, method, phoneNumber } = req.body;
+      
+      if (!userId || !method) {
+        return res.status(400).json({ message: 'User ID and 2FA method required' });
+      }
+
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      let setupData: any = {
+        method,
+        backupCodes: Array.from({ length: 8 }, () => 
+          Math.random().toString(36).substring(2, 8).toUpperCase()
+        )
+      };
+
+      if (method === 'totp') {
+        // Generate TOTP secret
+        const secret = speakeasy.generateSecret({
+          name: `Hi-LYTE (${user.email})`,
+          issuer: 'Hi-LYTE',
+          length: 32,
+        });
+
+        // Generate QR code
+        const qrCodeData = await QRCode.toDataURL(secret.otpauth_url!);
+
+        // Store secret temporarily (not enabled yet)
+        await storage.updateUser(userId, { 
+          twoFactorSecret: secret.base32,
+          twoFactorMethod: 'totp'
+        });
+
+        setupData = {
+          ...setupData,
+          secret: secret.base32,
+          qrCode: qrCodeData,
+          manualEntryKey: secret.base32
+        };
+      } else if (method === 'sms') {
+        if (!phoneNumber) {
+          return res.status(400).json({ message: 'Phone number required for SMS 2FA' });
+        }
+
+        // Store phone number
+        await storage.updateUser(userId, { 
+          phoneNumber,
+          twoFactorMethod: 'sms'
+        });
+
+        setupData.phoneNumber = phoneNumber;
+      } else if (method === 'email') {
+        // Use existing email
+        await storage.updateUser(userId, { 
+          twoFactorMethod: 'email'
+        });
+
+        setupData.email = user.email;
+      }
+
+      res.json({
+        twoFactorSetup: setupData,
+        message: `2FA setup prepared with ${method.toUpperCase()} method`
+      });
+    } catch (error) {
+      console.error('2FA setup error:', error);
+      res.status(500).json({ message: '2FA setup failed' });
+    }
+  });
+
+  // Simple 2FA Setup Route
+  app.post("/api/auth/setup-simple-2fa", async (req, res) => {
+    try {
+      const { userId, method, phoneNumber, email } = req.body;
+
+      if (!userId || !method) {
+        return res.status(400).json({ message: "User ID and method are required" });
+      }
+
+      if (method === 'sms' && !phoneNumber) {
+        return res.status(400).json({ message: "Phone number is required for SMS verification" });
+      }
+
+      if (method === 'email' && !email) {
+        return res.status(400).json({ message: "Email is required for email verification" });
+      }
+
+      // Generate and store verification code
+      const code = generateVerificationCode();
+      storeVerificationCode(userId, method, code);
+
+      // Send the code via SMS or email
+      let sent = false;
+      if (method === 'sms') {
+        sent = await sendSMSVerificationCode(phoneNumber, code);
+      } else if (method === 'email') {
+        sent = await sendEmailVerificationCode(email, code);
+      }
+
+      if (!sent) {
+        return res.status(500).json({ message: `Failed to send ${method} verification code` });
+      }
+
+      // Store the verification method for this user
+      await storage.updateUser(userId, {
+        twoFactorMethod: method,
+        phoneNumber: method === 'sms' ? phoneNumber : null,
+        twoFactorEmail: method === 'email' ? email : null
+      });
+
+      res.json({
+        message: `Verification code sent to your ${method === 'sms' ? 'phone' : 'email'}`
+      });
+    } catch (error) {
+      console.error("Simple 2FA setup error:", error);
+      res.status(500).json({ message: "Failed to setup 2FA" });
+    }
+  });
+
+  // Verify Simple 2FA Code
+  app.post("/api/auth/verify-simple-2fa", async (req, res) => {
+    try {
+      const { userId, code, method } = req.body;
+
+      if (!userId || !code || !method) {
+        return res.status(400).json({ message: "User ID, code, and method are required" });
+      }
+
+      // Verify the code
+      const result = verifyCode(userId, method, code);
+
+      if (!result.success) {
+        return res.status(400).json({ message: result.error });
+      }
+
+      // Enable 2FA for the user
+      await storage.updateUser(userId, {
+        twoFactorEnabled: true,
+        twoFactorMethod: method
+      });
+
+      res.json({
+        message: "Two-factor authentication setup complete"
+      });
+    } catch (error) {
+      console.error("Simple 2FA verification error:", error);
+      res.status(500).json({ message: "Failed to verify 2FA code" });
+    }
+  });
+
+  // Resend 2FA Code
+  app.post("/api/auth/resend-2fa-code", async (req, res) => {
+    try {
+      const { userId, method } = req.body;
+
+      if (!userId || !method) {
+        return res.status(400).json({ message: "User ID and method are required" });
+      }
+
+      // Get user details
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const contact = method === 'sms' ? user.phoneNumber : user.twoFactorEmail;
+      if (!contact) {
+        return res.status(400).json({ message: `No ${method === 'sms' ? 'phone number' : 'email'} on file` });
+      }
+
+      // Generate and store new verification code
+      const code = generateVerificationCode();
+      storeVerificationCode(userId, method, code);
+
+      // Send the code via SMS or email
+      let sent = false;
+      if (method === 'sms') {
+        sent = await sendSMSVerificationCode(contact, code);
+      } else if (method === 'email') {
+        sent = await sendEmailVerificationCode(contact, code);
+      }
+
+      if (!sent) {
+        return res.status(500).json({ message: `Failed to resend ${method} verification code` });
+      }
+
+      res.json({
+        message: `Verification code resent to your ${method === 'sms' ? 'phone' : 'email'}`
+      });
+    } catch (error) {
+      console.error("Resend 2FA code error:", error);
+      res.status(500).json({ message: "Failed to resend code" });
+    }
+  });
+
+  // Verify 2FA setup during registration
+  app.post('/api/auth/verify-2fa-setup', async (req, res) => {
+    try {
+      const { userId, token, method } = req.body;
+      
+      if (!userId || !token) {
+        return res.status(400).json({ message: 'User ID and verification token required' });
+      }
+
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      let verified = false;
+      const currentMethod = method || user.twoFactorMethod || 'totp';
+
+      if (currentMethod === 'totp') {
+        if (!user.twoFactorSecret) {
+          return res.status(400).json({ message: '2FA not set up' });
+        }
+
+        verified = speakeasy.totp.verify({
+          secret: user.twoFactorSecret,
+          encoding: 'base32',
+          token: token,
+          window: 2
+        });
+      } else if (currentMethod === 'sms' || currentMethod === 'email') {
+        const result = verifyCode(userId, currentMethod, token);
+        verified = result.success;
+        
+        if (!verified) {
+          return res.status(400).json({ 
+            message: result.error,
+            attemptsRemaining: result.attemptsRemaining
+          });
+        }
+      }
+
+      if (!verified) {
+        return res.status(400).json({ message: 'Invalid verification code' });
+      }
+
+      // Enable 2FA for the user
+      await storage.updateUser(userId, { 
+        twoFactorEnabled: true,
+        twoFactorMethod: currentMethod,
+        phoneVerified: currentMethod === 'sms' ? true : user.phoneVerified
+      });
+
+      res.json({ message: '2FA successfully enabled' });
+    } catch (error) {
+      console.error('2FA verification error:', error);
+      res.status(500).json({ message: '2FA verification failed' });
+    }
+  });
+
+  // Send verification code for SMS/Email 2FA
+  app.post('/api/auth/send-verification-code', async (req, res) => {
+    try {
+      const { userId, method } = req.body;
+      
+      if (!userId || !method) {
+        return res.status(400).json({ message: 'User ID and method required' });
+      }
+
+      if (!['sms', 'email'].includes(method)) {
+        return res.status(400).json({ message: 'Invalid method. Use sms or email.' });
+      }
+
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      const code = generateVerificationCode();
+      storeVerificationCode(userId, method, code);
+
+      let sent = false;
+      if (method === 'sms') {
+        if (!user.phoneNumber) {
+          return res.status(400).json({ message: 'Phone number not set up' });
+        }
+        sent = await sendSMSVerificationCode(user.phoneNumber, code);
+      } else if (method === 'email') {
+        sent = await sendEmailVerificationCode(user.email, code);
+      }
+
+      if (!sent) {
+        return res.status(500).json({ message: `Failed to send ${method.toUpperCase()} code` });
+      }
+
+      res.json({ 
+        message: `Verification code sent via ${method.toUpperCase()}`,
+        expiresIn: 10 // minutes
+      });
+    } catch (error) {
+      console.error('Send verification code error:', error);
+      res.status(500).json({ message: 'Failed to send verification code' });
+    }
+  });
+
+  // Login with 2FA support
+  app.post('/api/auth/login', async (req, res) => {
+    try {
+      const { usernameOrEmail, password, twoFactorCode } = req.body;
+      
+      if (!usernameOrEmail || !password) {
+        return res.status(400).json({ message: 'Username/email and password are required' });
+      }
+
+      // Find user by username or email
+      let user = await storage.getUserByUsername(usernameOrEmail);
+      if (!user) {
+        user = await storage.getUserByEmail(usernameOrEmail);
+      }
+
+      if (!user) {
+        return res.status(401).json({ message: 'Invalid credentials' });
+      }
+
+      // Verify password
+      const isValidPassword = await bcrypt.compare(password, user.passwordHash);
+      if (!isValidPassword) {
+        return res.status(401).json({ message: 'Invalid credentials' });
+      }
+
+      // Check if 2FA is enabled
+      if (user.twoFactorEnabled) {
+        if (!twoFactorCode) {
+          return res.status(200).json({ 
+            requires2FA: true,
+            twoFactorMethod: user.twoFactorMethod || 'totp',
+            message: 'Two-factor authentication code required'
+          });
+        }
+
+        // Verify 2FA code based on method
+        let verified = false;
+        const method = user.twoFactorMethod || 'totp';
+
+        if (method === 'totp') {
+          verified = speakeasy.totp.verify({
+            secret: user.twoFactorSecret!,
+            encoding: 'base32',
+            token: twoFactorCode,
+            window: 2
+          });
+        } else if (method === 'sms' || method === 'email') {
+          const result = verifyCode(user.id, method, twoFactorCode);
+          verified = result.success;
+          
+          if (!verified) {
+            return res.status(401).json({ 
+              message: result.error,
+              attemptsRemaining: result.attemptsRemaining
+            });
+          }
+        }
+
+        if (!verified) {
+          return res.status(401).json({ message: 'Invalid two-factor authentication code' });
+        }
+      }
+
+      // Login successful - create session and return user without sensitive data
+      const { passwordHash: _, twoFactorSecret: __, twoFactorBackupCodes: ___, ...userWithoutPassword } = user;
+      
+      // Set session
+      (req as any).session.user = userWithoutPassword;
+      
+      res.json({ 
+        user: userWithoutPassword,
+        message: 'Login successful'
+      });
+    } catch (error) {
+      console.error('Login error:', error);
+      res.status(500).json({ message: 'Login failed' });
+    }
+  });
+
+  // Projects routes
+  app.get('/api/projects', async (req, res) => {
+    try {
+      const projects = await storage.getProjects();
+      res.json(projects);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch projects' });
+    }
+  });
+
+  app.post('/api/projects', async (req, res) => {
+    try {
+      const validatedData = insertProjectSchema.parse(req.body);
+      const project = await storage.createProject(validatedData);
+      res.status(201).json(project);
+    } catch (error) {
+      res.status(400).json({ message: 'Invalid project data' });
+    }
+  });
+
+  app.get('/api/projects/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const project = await storage.getProject(id);
+      if (!project) {
+        return res.status(404).json({ message: 'Project not found' });
+      }
+      res.json(project);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch project' });
+    }
+  });
+
+  // Drawings routes
+  app.get('/api/drawings', async (req, res) => {
+    try {
+      const projectId = req.query.projectId ? parseInt(req.query.projectId as string) : undefined;
+      const drawings = await storage.getDrawings(projectId);
+      res.json(drawings);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch drawings' });
+    }
+  });
+
+  app.post('/api/drawings/upload', upload.single('drawing'), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: 'No file uploaded' });
+      }
+
+      // Check subscription limits before processing upload
+      const userLimits = await storage.checkUserLimits(1); // Using default userId 1
+      if (!userLimits.canUpload) {
+        // Return specific error for trial users who exceeded their limit
+        if (userLimits.subscriptionStatus === 'free_trial') {
+          return res.status(403).json({ 
+            message: 'Trial limit exceeded',
+            errorType: 'TRIAL_LIMIT_EXCEEDED',
+            details: 'Free trial allows only 1 drawing set. Upgrade to Hi-LYTE Pro for unlimited uploads.'
+          });
+        } else {
+          return res.status(403).json({ 
+            message: 'Upload limit exceeded',
+            errorType: 'UPLOAD_LIMIT_EXCEEDED'
+          });
+        }
+      }
+
+      const { projectId, name } = req.body;
+      const isPdf = req.file.mimetype === 'application/pdf';
+      
+      if (isPdf) {
+        // Process PDF and create individual drawings for each page
+        console.log('PDF detected, starting processing...');
+        try {
+          // Clean up old files before starting new upload
+          cleanupOldFiles();
+          
+          // Initialize upload status and reset cancellation token
+          uploadCancellationToken = { cancelled: false };
+          currentUploadStatus = {
+            phase: 'pdf_processing',
+            pagesProcessed: 0,
+            totalPages: 0,
+            currentTask: 'Processing PDF pages...',
+            fileName: req.file.originalname
+          };
+
+          const pdfResult = await processPDF(req.file.path, req.file.originalname, uploadCancellationToken, (processed, total) => {
+            // Check if upload was cancelled
+            if (uploadCancellationToken.cancelled) {
+              throw new Error('Upload cancelled by user');
+            }
+            
+            // Update progress as pages are processed
+            currentUploadStatus = {
+              ...currentUploadStatus,
+              pagesProcessed: processed,
+              totalPages: total,
+              currentTask: `Processing page ${processed} of ${total}...`
+            };
+          });
+          const baseFileName = req.file.originalname.replace(/\.[^/.]+$/, "");
+          const createdDrawings = [];
+
+          // Update status with total pages and mark PDF processing complete
+          currentUploadStatus = {
+            ...currentUploadStatus,
+            totalPages: pdfResult.totalPages,
+            pagesProcessed: pdfResult.totalPages,
+            currentTask: 'PDF processing complete',
+            phase: 'complete'
+          };
+
+          // Create the original PDF record as the parent
+          const originalDrawing = await storage.createDrawing({
+            projectId: projectId ? parseInt(projectId) : null,
+            name: name || req.file.originalname,
+            fileName: req.file.originalname,
+            filePath: req.file.path,
+            fileSize: req.file.size,
+            fileType: req.file.mimetype,
+            width: 1200,
+            height: 800,
+            pageNumber: 1,
+            totalPages: pdfResult.totalPages,
+            thumbnailPath: pdfResult.pages[0]?.thumbnailPath || null,
+            originalDrawingId: null,
+          });
+
+          createdDrawings.push(originalDrawing);
+
+          // Complete upload immediately and process AI metadata in background
+          currentUploadStatus = {
+            ...currentUploadStatus,
+            phase: 'complete',
+            pagesProcessed: pdfResult.totalPages,
+            currentTask: 'Upload complete - AI processing in background'
+          };
+          
+          // Return the drawing immediately for faster user experience
+          res.status(201).json(originalDrawing);
+
+          // Process AI metadata in background (don't block the response)
+          console.log('Starting background AI sheet metadata extraction for', pdfResult.totalPages, 'pages...');
+          backgroundAiStatus = {
+            isProcessing: true,
+            drawingId: originalDrawing.id,
+            currentPage: 0,
+            totalPages: pdfResult.totalPages,
+            fileName: req.file.originalname
+          };
+
+          extractAllSheetMetadata(originalDrawing.id, pdfResult.totalPages, false)
+            .then(async (sheetMetadata) => {
+              console.log('AI extracted metadata successfully:', sheetMetadata.length, 'pages');
+              console.log('Sample metadata:', JSON.stringify(sheetMetadata.slice(0, 2), null, 2));
+              
+              // Update the drawing with extracted metadata
+              try {
+                const updatedDrawing = await storage.updateDrawing(originalDrawing.id, {
+                  sheetMetadata: sheetMetadata
+                });
+                console.log('Drawing update result:', updatedDrawing ? 'Success' : 'Failed');
+                console.log('Background sheet metadata extraction completed successfully');
+              } catch (updateError) {
+                console.error('Failed to save metadata to database:', updateError);
+                throw updateError;
+              }
+              
+              // Reset background status
+              backgroundAiStatus = {
+                isProcessing: false,
+                drawingId: null,
+                currentPage: 0,
+                totalPages: 0,
+                fileName: ''
+              };
+            })
+            .catch((metadataError) => {
+              console.error('Background sheet metadata extraction failed:', metadataError);
+              console.error('Error stack:', metadataError?.stack);
+              // Reset background status even on failure
+              backgroundAiStatus = {
+                isProcessing: false,
+                drawingId: null,
+                currentPage: 0,
+                totalPages: 0,
+                fileName: ''
+              };
+            });
+        } catch (pdfError) {
+          console.error('PDF processing error:', pdfError);
+          
+          // Check if this is a deliberate user cancellation (only if cancellation token was explicitly set)
+          if (uploadCancellationToken?.cancelled && pdfError instanceof Error && pdfError.message.includes('cancelled')) {
+            console.log('PDF processing was cancelled by user');
+            // Reset upload status to indicate cancellation
+            currentUploadStatus = {
+              phase: 'idle',
+              pagesProcessed: 0,
+              totalPages: 0,
+              currentTask: 'Upload cancelled',
+              fileName: ''
+            };
+            return res.status(409).json({ message: 'Upload cancelled by user' });
+          }
+          
+          console.error('PDF processing stack:', pdfError instanceof Error ? pdfError.stack : 'No stack trace');
+          // Fallback: create single drawing record for the PDF
+          const drawing = await storage.createDrawing({
+            projectId: projectId ? parseInt(projectId) : null,
+            name: name || req.file.originalname,
+            fileName: req.file.originalname,
+            filePath: req.file.path,
+            fileSize: req.file.size,
+            fileType: req.file.mimetype,
+            width: 1200,
+            height: 800,
+            pageNumber: 1,
+            totalPages: 1,
+            thumbnailPath: null,
+            originalDrawingId: null,
+          });
+          console.log('Created fallback PDF drawing:', drawing);
+          res.status(201).json(drawing);
+        }
+      } else {
+        // Handle regular image files
+        const drawing = await storage.createDrawing({
+          projectId: projectId ? parseInt(projectId) : null,
+          name: name || req.file.originalname,
+          fileName: req.file.originalname,
+          filePath: req.file.path,
+          fileSize: req.file.size,
+          fileType: req.file.mimetype,
+          width: null,
+          height: null,
+          pageNumber: 1,
+          totalPages: 1,
+          thumbnailPath: null,
+          originalDrawingId: null,
+        });
+        res.status(201).json(drawing);
+      }
+    } catch (error) {
+      console.error('Upload error:', error);
+      res.status(500).json({ message: 'Failed to upload drawing' });
+    }
+  });
+
+  // Upload status endpoint
+  app.get('/api/upload/status', async (req, res) => {
+    res.json(currentUploadStatus);
+  });
+
+  // Cancel upload processing endpoint
+  app.post('/api/upload/cancel', (req, res) => {
+    console.log('Cancelling upload processing...');
+    
+    // Set cancellation token to stop the PDF processing loop
+    if (uploadCancellationToken) {
+      uploadCancellationToken.cancelled = true;
+      console.log('Cancellation token set to true');
+    } else {
+      console.log('Warning: uploadCancellationToken is undefined');
+    }
+    
+    // Reset upload status
+    currentUploadStatus = {
+      phase: 'idle',
+      pagesProcessed: 0,
+      totalPages: 0,
+      currentTask: 'Upload cancelled',
+      fileName: ''
+    };
+    
+    // Cancel background AI processing as well if active
+    if (backgroundAiStatus.isProcessing) {
+      console.log(`Also cancelling background AI processing for drawing ${backgroundAiStatus.drawingId}`);
+      backgroundAiStatus = {
+        isProcessing: false,
+        drawingId: null,
+        currentPage: 0,
+        totalPages: 0,
+        fileName: ''
+      };
+    }
+    
+    console.log('Upload cancellation completed successfully');
+    res.json({ message: 'Upload processing cancelled successfully' });
+  });
+
+  // Background AI processing status endpoint
+  app.get('/api/background-ai/status', async (req, res) => {
+    res.json(backgroundAiStatus);
+  });
+
+  // Cancel background AI processing endpoint
+  app.post('/api/background-ai/cancel', async (req, res) => {
+    try {
+      const { drawingId } = req.body;
+      
+      if (backgroundAiStatus.isProcessing && (!drawingId || backgroundAiStatus.drawingId === drawingId)) {
+        console.log(`Manually cancelling background AI processing for drawing ${backgroundAiStatus.drawingId}`);
+        backgroundAiStatus = {
+          isProcessing: false,
+          drawingId: null,
+          currentPage: 0,
+          totalPages: 0,
+          fileName: ''
+        };
+        res.json({ message: 'Background AI processing cancelled successfully' });
+      } else {
+        res.json({ message: 'No background AI processing to cancel' });
+      }
+    } catch (error) {
+      console.error('Error cancelling background AI processing:', error);
+      res.status(500).json({ message: 'Failed to cancel background AI processing' });
+    }
+  });
+
+  // Re-extract metadata for a drawing (useful for testing improved AI)
+  app.post('/api/drawings/:id/reextract-metadata', async (req, res) => {
+    try {
+      const drawingId = parseInt(req.params.id);
+      const drawing = await storage.getDrawing(drawingId);
+      
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      console.log(`Re-extracting metadata for drawing ${drawingId} with ${drawing.totalPages} pages...`);
+      
+      // Start background re-extraction
+      backgroundAiStatus = {
+        isProcessing: true,
+        drawingId: drawing.id,
+        currentPage: 0,
+        totalPages: drawing.totalPages || 1,
+        fileName: drawing.name
+      };
+
+      // Run extraction in background
+      extractAllSheetMetadata(drawing.id, drawing.totalPages || 1)
+        .then(async (sheetMetadata) => {
+          await storage.updateDrawing(drawing.id, {
+            sheetMetadata: sheetMetadata
+          });
+          console.log('Background metadata re-extraction completed successfully');
+          backgroundAiStatus = {
+            isProcessing: false,
+            drawingId: null,
+            currentPage: 0,
+            totalPages: 0,
+            fileName: ''
+          };
+        })
+        .catch((metadataError) => {
+          console.error('Background metadata re-extraction failed:', metadataError);
+          backgroundAiStatus = {
+            isProcessing: false,
+            drawingId: null,
+            currentPage: 0,
+            totalPages: 0,
+            fileName: ''
+          };
+        });
+
+      res.json({ message: 'Metadata re-extraction started in background' });
+    } catch (error) {
+      console.error('Error starting metadata re-extraction:', error);
+      res.status(500).json({ message: 'Failed to start metadata re-extraction' });
+    }
+  });
+
+
+
+  app.get('/api/drawings/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const drawing = await storage.getDrawing(id);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+      res.json(drawing);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch drawing' });
+    }
+  });
+
+  // Drawing metadata endpoint for AI-extracted sheet labels
+  app.get('/api/drawings/:id/metadata', async (req, res) => {
+    try {
+      const drawingId = parseInt(req.params.id);
+      const drawing = await storage.getDrawing(drawingId);
+      
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      if (drawing.sheetMetadata) {
+        // Check if it's already an array (from database)
+        if (Array.isArray(drawing.sheetMetadata)) {
+          res.json(drawing.sheetMetadata);
+        } else if (typeof drawing.sheetMetadata === 'string') {
+          // If it's a string, parse it
+          try {
+            const metadata = JSON.parse(drawing.sheetMetadata);
+            res.json(metadata);
+          } catch (error) {
+            console.error('Error parsing sheet metadata string:', error);
+            res.json([]);
+          }
+        } else if (typeof drawing.sheetMetadata === 'object' && drawing.sheetMetadata !== null) {
+          // If it's already an object, return it directly
+          res.json(drawing.sheetMetadata);
+        } else {
+          res.json([]);
+        }
+      } else {
+        res.json([]);
+      }
+    } catch (error) {
+      console.error('Error fetching drawing metadata:', error);
+      res.status(500).json({ message: 'Failed to fetch metadata' });
+    }
+  });
+
+  // Hybrid AI + OCR Search endpoint
+  app.post('/api/drawings/:id/search', async (req, res) => {
+    try {
+      const drawingId = parseInt(req.params.id);
+      const { query } = req.body;
+      
+      if (!query || typeof query !== 'string') {
+        return res.status(400).json({ message: 'Search query is required' });
+      }
+      
+      const drawing = await storage.getDrawing(drawingId);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      console.log(`Hybrid search for "${query}" in drawing ${drawingId} with ${drawing.totalPages} pages`);
+      
+      const searchResults = [];
+      const totalPages = drawing.totalPages || 1;
+      const searchTerm = query.toLowerCase();
+      
+      // Step 1: Use AI to quickly identify relevant pages (analyze all pages)
+      console.log('Step 1: AI filtering all pages for relevance...');
+      const relevantPages = [];
+      
+      // Process pages in batches of 5 for AI analysis
+      const batchSize = 5;
+      for (let startPage = 1; startPage <= totalPages; startPage += batchSize) {
+        const endPage = Math.min(startPage + batchSize - 1, totalPages);
+        const batch = [];
+        
+        for (let page = startPage; page <= endPage; page++) {
+          const imagePath = `uploads/pages/page.${page}.png`;
+          if (fs.existsSync(imagePath)) {
+            batch.push({ page, imagePath });
+          }
+        }
+        
+        if (batch.length > 0) {
+          try {
+            // Use AI to analyze this batch of pages - WITH CREDIT TRACKING
+            const aiResults = await analyzePageBatchForSearch(batch, query, req.user.id);
+            relevantPages.push(...aiResults);
+          } catch (aiError) {
+            console.log(`AI analysis failed for batch ${startPage}-${endPage}, falling back to OCR for all pages`);
+            // If AI fails, add all pages in batch to relevant pages for OCR
+            batch.forEach(item => relevantPages.push({ page: item.page, confidence: 0.5, reason: 'AI fallback' }));
+          }
+        }
+      }
+      
+      console.log(`AI identified ${relevantPages.length} potentially relevant pages:`, relevantPages.map(p => `page ${p.page} (${Math.round(p.confidence * 100)}%)`));
+      
+      // Step 2: Use OCR on AI-filtered pages for precise text matching
+      console.log('Step 2: OCR analysis on filtered pages...');
+      const ocrPromises = relevantPages.map(async (relevantPage) => {
+        try {
+          const imagePath = `uploads/pages/page.${relevantPage.page}.png`;
+          
+          // Use Tesseract to extract text from this page
+          const tesseract = await import('tesseract.js');
+          const { data: { text } } = await tesseract.default.recognize(imagePath, 'eng', {
+            logger: () => {} // Suppress tesseract logs
+          });
+          
+          const pageText = text.toLowerCase();
+          const matches = (pageText.match(new RegExp(searchTerm, 'gi')) || []).length;
+          
+          if (matches > 0) {
+            console.log(`OCR confirmed ${matches} matches for "${query}" on page ${relevantPage.page}`);
+            return {
+              page: relevantPage.page,
+              matches: matches,
+              text: text,
+              aiConfidence: relevantPage.confidence,
+              aiReason: relevantPage.reason
+            };
+          }
+          
+          return null;
+        } catch (pageError) {
+          console.error(`Error processing page ${relevantPage.page}:`, pageError);
+          return null;
+        }
+      });
+      
+      // Wait for all OCR processing to complete
+      const ocrResults = await Promise.all(ocrPromises);
+      const validResults = ocrResults.filter(result => result !== null);
+      
+      // Step 3: Combine and sort results by relevance
+      const finalResults = validResults.sort((a, b) => {
+        // Sort by AI confidence first, then by number of matches
+        if (a.aiConfidence !== b.aiConfidence) {
+          return b.aiConfidence - a.aiConfidence;
+        }
+        return b.matches - a.matches;
+      });
+      
+      console.log(`Hybrid search complete: found ${finalResults.length} pages with confirmed matches`);
+      console.log('Final results:', JSON.stringify(finalResults.map(r => ({ 
+        page: r.page, 
+        matches: r.matches, 
+        confidence: Math.round(r.aiConfidence * 100) + '%',
+        reason: r.aiReason
+      })), null, 2));
+      
+      res.json(finalResults);
+    } catch (error) {
+      console.error('Hybrid search error:', error);
+      res.status(500).json({ message: 'Search failed' });
+    }
+  });
+
+  // Helper function for AI page batch analysis - WITH CREDIT TRACKING
+  async function analyzePageBatchForSearch(batch, query, userId) {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      console.log('No AI key available, skipping AI analysis');
+      return batch.map(item => ({ page: item.page, confidence: 0.5, reason: 'No AI available' }));
+    }
+
+    try {
+
+      // Prepare images for AI analysis
+      const imageData = [];
+      for (const item of batch) {
+        try {
+          const imageBuffer = fs.readFileSync(item.imagePath);
+          const base64Image = imageBuffer.toString('base64');
+          imageData.push({
+            page: item.page,
+            base64: base64Image
+          });
+        } catch (err) {
+          console.log(`Failed to read image for page ${item.page}`);
+        }
+      }
+
+      if (imageData.length === 0) {
+        return [];
+      }
+
+      // Create AI message content
+      const messageContent = [
+        {
+          type: "text",
+          text: `Analyze these construction drawing pages and determine which ones are likely to contain the search term "${query}". 
+
+For each page, consider:
+- Visible text and labels
+- Drawing content and context
+- Technical elements and annotations
+- Handwritten notes
+
+Return a JSON array with this format:
+[
+  {
+    "page": 1,
+    "confidence": 0.8,
+    "reason": "Contains electrical panel schedules with visible text"
+  },
+  {
+    "page": 2,
+    "confidence": 0.3,
+    "reason": "Mostly structural drawings, less likely to contain search term"
+  }
+]
+
+Only include pages with confidence > 0.2. Be selective - it's better to miss some results than process too many irrelevant pages.`
+        }
+      ];
+
+      // Add images to message content
+      imageData.forEach((img, index) => {
+        messageContent.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: "image/png",
+            data: img.base64
+          }
+        });
+        messageContent.push({
+          type: "text",
+          text: `^ This is page ${img.page}`
+        });
+      });
+
+      // Use credit tracking for AI calls
+      const prompt = `Analyze these construction drawing pages and identify which ones are most likely to contain: "${searchQuery}"
+
+Return a JSON array with confidence scores for each page. Format:
+[
+  {
+    "page": 1,
+    "confidence": 0.8,
+    "reason": "Contains door schedule and specifications matching search term"
+  },
+  {
+    "page": 2,
+    "confidence": 0.3,
+    "reason": "Mostly structural drawings, less likely to contain search term"
+  }
+]
+
+Only include pages with confidence > 0.2. Be selective - it's better to miss some results than process too many irrelevant pages.`;
+
+      const aiResult = await AiCreditService.processAiRequest(
+        req.user.id,
+        'drawing_analysis',
+        prompt,
+        undefined,
+        "claude-sonnet-4-20250514"
+      );
+
+      if (!aiResult.success) {
+        console.log('AI analysis failed:', aiResult.error);
+        // Return all pages with medium confidence as fallback
+        return batch.map(item => ({ page: item.page, confidence: 0.5, reason: 'AI unavailable' }));
+      }
+
+      const result = JSON.parse(aiResult.response);
+      return result.filter(result => result.confidence > 0.2);
+
+
+
+    } catch (aiError) {
+      console.error('AI analysis error:', aiError);
+      // Return all pages with medium confidence as fallback
+      return batch.map(item => ({ page: item.page, confidence: 0.5, reason: 'AI error fallback' }));
+    }
+  }
+
+  app.delete('/api/drawings/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const drawing = await storage.getDrawing(id);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      // Cancel any ongoing AI processing for this drawing
+      if (backgroundAiStatus.isProcessing && backgroundAiStatus.drawingId === id) {
+        console.log(`Cancelling background AI processing for drawing ${id}`);
+        backgroundAiStatus = {
+          isProcessing: false,
+          drawingId: null,
+          currentPage: 0,
+          totalPages: 0,
+          fileName: ''
+        };
+      }
+
+      // Cancel any ongoing Smart Extraction for this drawing
+      try {
+        const { SmartExtractionService } = await import('./smart-extraction-service.js');
+        const smartExtractionService = new SmartExtractionService();
+        const smartStatus = smartExtractionService.getBulkExtractionStatus();
+        if (smartStatus.isProcessing && smartStatus.drawingId === id) {
+          console.log(`Cancelling Smart Extraction processing for drawing ${id}`);
+          smartExtractionService.cancelBulkExtraction(id);
+        }
+      } catch (smartExtractionError) {
+        console.warn('Error cancelling Smart Extraction:', smartExtractionError);
+      }
+
+      // Cancel current upload if it's for this drawing
+      if (currentUploadStatus.phase !== 'idle') {
+        console.log(`Cancelling upload processing for drawing ${id}`);
+        currentUploadStatus = {
+          phase: 'idle',
+          pagesProcessed: 0,
+          totalPages: 0,
+          currentTask: '',
+          fileName: ''
+        };
+      }
+
+      // Delete the physical file if it exists
+      if (fs.existsSync(drawing.filePath)) {
+        fs.unlinkSync(drawing.filePath);
+      }
+      
+      // Delete thumbnail if it exists
+      if (drawing.thumbnailPath && fs.existsSync(drawing.thumbnailPath)) {
+        fs.unlinkSync(drawing.thumbnailPath);
+      }
+
+      // Delete associated pages directory if it exists
+      const pagesDir = path.join(process.cwd(), 'uploads', 'pages');
+      if (fs.existsSync(pagesDir)) {
+        try {
+          const files = fs.readdirSync(pagesDir);
+          files.forEach(file => {
+            if (file.startsWith('page.')) {
+              const pagePath = path.join(pagesDir, file);
+              if (fs.existsSync(pagePath)) {
+                fs.unlinkSync(pagePath);
+              }
+            }
+          });
+          console.log(`Cleaned up page files for drawing ${id}`);
+        } catch (cleanupError) {
+          console.error('Error cleaning up page files:', cleanupError);
+        }
+      }
+
+      // Delete from database
+      const success = await storage.deleteDrawing(id);
+      if (!success) {
+        return res.status(500).json({ message: 'Failed to delete drawing from database' });
+      }
+
+      console.log(`Drawing ${id} deleted successfully with AI processing cancelled`);
+      res.json({ message: 'Drawing deleted successfully' });
+    } catch (error) {
+      console.error('Delete drawing error:', error);
+      res.status(500).json({ message: 'Failed to delete drawing' });
+    }
+  });
+
+  // Assign drawing to folder
+  app.put('/api/drawings/:id/folder', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const { folderId } = req.body;
+      
+      console.log('Folder assignment request:', { drawingId: id, folderId, body: req.body });
+      
+      const drawing = await storage.getDrawing(id);
+      if (!drawing) {
+        console.log('Drawing not found:', id);
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      console.log('Found drawing:', { id: drawing.id, name: drawing.name, currentFolderId: drawing.folderId });
+
+      // Update drawing with folder assignment
+      await storage.updateDrawing(id, {
+        folderId: folderId || null
+      });
+
+      console.log('Drawing folder assignment updated:', { drawingId: id, newFolderId: folderId });
+      res.json({ message: 'Drawing folder assignment updated successfully' });
+    } catch (error) {
+      console.error('Error updating drawing folder:', error);
+      res.status(500).json({ message: 'Failed to update drawing folder' });
+    }
+  });
+
+  // Serve uploaded files (with page support for PDFs)
+  app.get('/api/drawings/:id/file', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const page = parseInt(req.query.page as string) || 1;
+      const drawing = await storage.getDrawing(id);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+      
+      // For PDFs, serve the converted PNG for the requested page
+      if (drawing.fileType === 'application/pdf') {
+        const pageImagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${page}.png`);
+        
+        if (fs.existsSync(pageImagePath)) {
+          console.log(`Serving PNG for drawing ${id}, page ${page}: ${pageImagePath}`);
+          return res.sendFile(path.resolve(pageImagePath));
+        } else {
+          console.log(`PNG not found for drawing ${id}, page ${page}, falling back to original PDF`);
+        }
+      }
+      
+      // For regular images or if PNG not found, serve original file
+      if (!fs.existsSync(drawing.filePath)) {
+        return res.status(404).json({ message: 'File not found' });
+      }
+
+      console.log(`Serving original file for drawing ${id}: ${drawing.filePath}`);
+      res.sendFile(path.resolve(drawing.filePath));
+    } catch (error) {
+      console.error('File serving error:', error);
+      res.status(500).json({ message: 'Failed to serve drawing file' });
+    }
+  });
+
+  // Serve thumbnail images
+  app.get('/api/drawings/:id/thumbnail', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const drawing = await storage.getDrawing(id);
+      if (!drawing || !drawing.thumbnailPath) {
+        return res.status(404).json({ message: 'Thumbnail not found' });
+      }
+      
+      const thumbnailPath = path.resolve(drawing.thumbnailPath);
+      if (!fs.existsSync(thumbnailPath)) {
+        return res.status(404).json({ message: 'Thumbnail file not found' });
+      }
+
+      res.sendFile(thumbnailPath);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to serve thumbnail' });
+    }
+  });
+
+  // Get sheet metadata for a drawing
+  app.get("/api/drawings/:id/metadata", async (req, res) => {
+    try {
+      const drawingId = parseInt(req.params.id);
+      const drawing = await storage.getDrawing(drawingId);
+      
+      if (!drawing) {
+        return res.status(404).json({ error: "Drawing not found" });
+      }
+
+      // If metadata exists in database, return it
+      if (drawing.sheetMetadata && Array.isArray(drawing.sheetMetadata)) {
+        return res.json(drawing.sheetMetadata);
+      }
+
+      // Otherwise, generate basic metadata based on pages
+      const metadata = [];
+      const totalPages = drawing.totalPages || 1;
+      
+      for (let page = 1; page <= totalPages; page++) {
+        let displayLabel = `Page ${page}`;
+        
+        if (page === 1) {
+          displayLabel = "Cover Page";
+        } else if (page === 2) {
+          // Example: Generate typical construction sheet labels for demonstration
+          displayLabel = "G-001, General Notes and Abbreviations";
+        } else if (page === 3) {
+          displayLabel = "A-101, First Floor Plan";
+        } else if (page === 4) {
+          displayLabel = "A-201, Elevations";
+        } else if (page === 5) {
+          displayLabel = "S-101, Foundation Plan";
+        } else {
+          displayLabel = `Sheet ${page - 1}`;
+        }
+        
+        metadata.push({
+          pageNumber: page,
+          displayLabel,
+          isValid: true
+        });
+      }
+
+      res.json(metadata);
+    } catch (error: any) {
+      console.error("Error getting drawing metadata:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Serve static files from uploads directory
+  app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+
+  // Construction Divisions routes
+  app.get('/api/construction-divisions', async (req, res) => {
+    try {
+      const divisions = await storage.getConstructionDivisions();
+      res.json(divisions);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch construction divisions' });
+    }
+  });
+
+  app.post('/api/construction-divisions', async (req, res) => {
+    try {
+      const validatedData = insertConstructionDivisionSchema.parse(req.body);
+      const division = await storage.createConstructionDivision(validatedData);
+      res.status(201).json(division);
+    } catch (error) {
+      res.status(400).json({ message: 'Invalid construction division data' });
+    }
+  });
+
+
+
+  app.patch('/api/construction-divisions/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const validatedData = insertConstructionDivisionSchema.partial().parse(req.body);
+      const division = await storage.updateConstructionDivision(id, validatedData);
+      if (!division) {
+        return res.status(404).json({ message: 'Construction division not found' });
+      }
+      res.json(division);
+    } catch (error) {
+      res.status(400).json({ message: 'Invalid construction division data' });
+    }
+  });
+
+  app.delete('/api/construction-divisions/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const success = await storage.deleteConstructionDivision(id);
+      if (!success) {
+        return res.status(404).json({ message: 'Construction division not found' });
+      }
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to delete construction division' });
+    }
+  });
+
+  // Extraction Template routes
+  app.get('/api/construction-divisions/:id/template', async (req, res) => {
+    try {
+      const divisionId = parseInt(req.params.id);
+      const division = await storage.getConstructionDivision(divisionId);
+      
+      if (!division) {
+        return res.status(404).json({ message: 'Division not found' });
+      }
+
+      if (division.extractionTemplate) {
+        try {
+          const template = JSON.parse(division.extractionTemplate);
+          res.json(template);
+        } catch (error) {
+          console.error('Error parsing extraction template:', error);
+          res.json(null);
+        }
+      } else {
+        // Generate intelligent default template for the division
+        const divisionCode = parseInt(division.code);
+        const defaultTemplate = ExtractionTemplateService.generateDefaultTemplateForDivision(divisionCode, division.name);
+        res.json(defaultTemplate);
+      }
+    } catch (error) {
+      console.error('Error fetching extraction template:', error);
+      res.status(500).json({ message: 'Failed to fetch extraction template' });
+    }
+  });
+
+  app.post('/api/construction-divisions/:id/template', async (req, res) => {
+    try {
+      const divisionId = parseInt(req.params.id);
+      const template: ExtractionTemplate = req.body;
+      
+      const division = await storage.getConstructionDivision(divisionId);
+      if (!division) {
+        return res.status(404).json({ message: 'Division not found' });
+      }
+
+      // Save template to division
+      const updatedDivision = await storage.updateConstructionDivision(divisionId, {
+        extractionTemplate: JSON.stringify(template)
+      });
+
+      res.json({ message: 'Template saved successfully', template });
+    } catch (error) {
+      console.error('Error saving extraction template:', error);
+      res.status(500).json({ message: 'Failed to save extraction template' });
+    }
+  });
+
+  // Generate AI-powered template for construction division
+  app.post('/api/construction-divisions/:id/generate-template', async (req, res) => {
+    try {
+      const divisionId = parseInt(req.params.id);
+      const division = await storage.getConstructionDivision(divisionId);
+      
+      if (!division) {
+        return res.status(404).json({ message: 'Division not found' });
+      }
+
+      // Generate AI-powered column suggestions
+      const aiColumns = await generateIndustrySpecificColumns(division.name, division.code);
+      
+      const aiTemplate = {
+        id: `ai-generated-${divisionId}`,
+        name: `AI Template - ${division.name}`,
+        description: `AI-generated template for ${division.name} with industry-standard columns`,
+        columns: aiColumns,
+        divisionId: divisionId
+      };
+
+      // Save the generated template to the division
+      const updatedDivision = await storage.updateConstructionDivision(divisionId, {
+        extractionTemplate: JSON.stringify(aiTemplate)
+      });
+
+      if (!updatedDivision) {
+        return res.status(500).json({ message: 'Failed to save AI template' });
+      }
+
+      res.json(aiTemplate);
+    } catch (error) {
+      console.error('Error generating AI template:', error);
+      res.status(500).json({ message: 'Failed to generate AI template' });
+    }
+  });
+
+  app.get('/api/extraction-templates/defaults', async (req, res) => {
+    try {
+      const defaultTemplates = ExtractionTemplateService.getDefaultTemplates();
+      // Convert object to array format for the template library
+      const templatesArray = Object.values(defaultTemplates);
+      res.json(templatesArray);
+    } catch (error) {
+      console.error('Error fetching default templates:', error);
+      res.status(500).json({ message: 'Failed to fetch default templates' });
+    }
+  });
+
+  // Extracted Data routes
+  app.get('/api/extracted-data', async (req, res) => {
+    try {
+      const drawingId = req.query.drawingId ? parseInt(req.query.drawingId as string) : undefined;
+      const extractedData = await storage.getExtractedData(drawingId);
+      res.json(extractedData);
+    } catch (error) {
+      console.error('Error fetching extracted data:', error);
+      res.status(500).json({ message: 'Failed to fetch extracted data' });
+    }
+  });
+
+  app.post('/api/extracted-data', async (req, res) => {
+    try {
+      // Check if user is authenticated
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: 'Not authenticated' });
+      }
+
+      // Check AI credits before proceeding with extraction
+      const { AiCreditService } = await import('./ai-credit-service');
+      const estimatedCost = 0.01; // Rough estimate for basic extraction
+      
+      const hasCredits = await AiCreditService.checkCredits(req.user.id, estimatedCost);
+      if (!hasCredits) {
+        // Check if user has auto-purchase enabled
+        const user = await db.select().from(users).where(eq(users.id, req.user.id)).limit(1);
+        if (!user[0]?.autoPurchaseCredits || !user[0].autoPurchaseAmount) {
+          return res.status(402).json({ 
+            message: 'Insufficient AI credits. Please purchase more credits to continue.',
+            error: 'INSUFFICIENT_CREDITS'
+          });
+        }
+      }
+
+      // Ensure all required fields are included with defaults
+      const dataWithDefaults = {
+        ...req.body,
+        aiEnhanced: req.body.aiEnhanced || false,
+        confidence: req.body.confidence || 0.0,
+        extractionMethod: req.body.extractionMethod || 'ocr',
+        suggestions: req.body.suggestions || null,
+        manuallyCorreted: req.body.manuallyCorreted || false
+      };
+      const validatedData = insertExtractedDataSchema.parse(dataWithDefaults);
+      const extractedData = await storage.createExtractedData(validatedData);
+      
+      res.status(201).json(extractedData);
+    } catch (error) {
+      console.error('Error creating extracted data:', error);
+      res.status(400).json({ message: 'Invalid extracted data' });
+    }
+  });
+
+  app.patch('/api/extracted-data/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const updatedData = req.body;
+      
+      // Validate that we have at least some data to update
+      if (!updatedData.data && updatedData.data !== '') {
+        return res.status(400).json({ message: 'No data provided for update' });
+      }
+      
+      const result = await storage.updateExtractedData(id, updatedData);
+      if (!result) {
+        return res.status(404).json({ message: 'Extracted data not found' });
+      }
+      
+      res.json(result);
+    } catch (error) {
+      console.error('Error updating extracted data:', error);
+      res.status(500).json({ message: 'Failed to update extracted data' });
+    }
+  });
+
+  app.delete('/api/extracted-data/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const deleted = await storage.deleteExtractedData(id);
+      if (!deleted) {
+        return res.status(404).json({ message: 'Extracted data not found' });
+      }
+      res.status(204).send();
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to delete extracted data' });
+    }
+  });
+
+  // Delete all extracted data for a specific division
+  app.delete('/api/extracted-data', async (req, res) => {
+    try {
+      const divisionId = req.query.divisionId;
+      if (!divisionId) {
+        return res.status(400).json({ message: 'divisionId parameter is required' });
+      }
+      
+      const divisionIdNum = parseInt(divisionId as string);
+      if (isNaN(divisionIdNum)) {
+        return res.status(400).json({ message: 'divisionId must be a valid number' });
+      }
+      
+      console.log(`Deleting all extracted data for division ${divisionIdNum}`);
+      const deletedCount = await storage.deleteExtractedDataByDivision(divisionIdNum);
+      console.log(`Deleted ${deletedCount} extracted data items for division ${divisionIdNum}`);
+      
+      res.status(200).json({ deletedCount });
+    } catch (error) {
+      console.error('Failed to delete extracted data by division:', error);
+      res.status(500).json({ message: 'Failed to delete extracted data' });
+    }
+  });
+
+  // OCR endpoint for text extraction from image regions (now with hybrid approach)
+  app.post('/api/drawings/:id/ocr', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      // Check user subscription limits before extraction
+      const limits = await storage.checkUserLimits(req.user.id);
+      if (!limits.canExtract) {
+        return res.status(403).json({ 
+          error: 'Extraction limit reached',
+          message: 'Please upgrade to Koncurent Pro for unlimited extractions',
+          limits 
+        });
+      }
+
+      const drawingId = parseInt(req.params.id);
+      const { page, region } = req.body;
+      
+      if (!region || !region.x || !region.y || !region.width || !region.height) {
+        return res.status(400).json({ message: 'Invalid region coordinates' });
+      }
+
+      const drawing = await storage.getDrawing(drawingId);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      let extractionResult;
+      let extractionMethod = 'unknown';
+
+      // Try text-based extraction first for PDFs
+      if (drawing.fileType === 'application/pdf') {
+        console.log('Attempting text-based PDF extraction...');
+        
+        try {
+          // Check if PDF is text-based
+          const isTextBased = await isPDFTextBased(drawing.filePath, page || 1);
+          
+          if (isTextBased) {
+            console.log('PDF is text-based, using direct text extraction...');
+            const pdfResult = await extractTextFromPDFRegion(drawing.filePath, page || 1, region);
+            
+            if (pdfResult.confidence > 0.7) {
+              // Format the result for table display
+              let formattedText = pdfResult.text;
+              
+              if (pdfResult.tables.length > 0) {
+                const table = pdfResult.tables[0];
+                console.log(`Extracted table with ${table.headers.length} columns and ${table.rows.length} rows`);
+                
+                // Format as structured table
+                formattedText = formatTableForDisplay(table);
+                extractionMethod = 'text-based-table';
+              } else {
+                extractionMethod = 'text-based';
+              }
+              
+              extractionResult = {
+                text: formattedText,
+                confidence: pdfResult.confidence,
+                method: extractionMethod
+              };
+            }
+          }
+        } catch (pdfError) {
+          console.error('PDF text extraction failed:', pdfError);
+        }
+      }
+
+      // Try AI extraction first if available, then fallback to OCR
+      if (!extractionResult) {
+        // Get the path to the PNG image for the specified page
+        const pageImagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${page || 1}.png`);
+        
+        if (!fs.existsSync(pageImagePath)) {
+          return res.status(404).json({ message: 'Page image not found' });
+        }
+
+        // Try AI extraction first WITH CREDIT TRACKING
+        if (aiExtractionService.isEnabled()) {
+          console.log('Attempting AI extraction with credit tracking...');
+          try {
+            // Convert image to base64 for AI processing
+            const imageBuffer = fs.readFileSync(pageImagePath);
+            const base64Image = imageBuffer.toString('base64');
+            
+            // Prepare AI prompt for extraction
+            const prompt = `Extract text data from construction drawing region at coordinates (${region.x}, ${region.y}, ${region.width}x${region.height}). 
+            
+            Analyze this construction document section and extract all visible text, tables, schedules, and specifications. 
+            Return clean, structured text that preserves formatting and hierarchy.
+            
+            Focus on accuracy for construction schedules, door/window specifications, and technical data.`;
+
+            // Use the credit tracking service for AI extraction
+            const aiResult = await AiCreditService.processAiRequest(
+              req.user.id,
+              'text_extraction',
+              prompt,
+              undefined, // extractedDataId - will be set after saving
+              'claude-sonnet-4-20250514',
+              { base64: base64Image, mediaType: 'image/png' }
+            );
+
+            if (aiResult.success && aiResult.response) {
+              console.log('AI extraction with credits successful:', { 
+                cost: aiResult.cost, 
+                tokens: aiResult.tokensUsed,
+                textLength: aiResult.response.length 
+              });
+              
+              extractionResult = {
+                text: aiResult.response,
+                confidence: 0.95, // AI typically has high confidence
+                method: 'ai-enhanced'
+              };
+              extractionMethod = 'ai-enhanced';
+            } else {
+              console.log('AI extraction failed:', aiResult.error);
+              // Continue to OCR fallback
+            }
+          } catch (aiError) {
+            console.error('AI extraction failed, falling back to OCR:', aiError);
+            // Continue to regular OCR fallback
+          }
+        }
+        
+        // Fallback to OCR if AI failed or not available
+        if (!extractionResult) {
+          console.log('Falling back to OCR extraction...');
+          // Extract text from the selected region using new extraction engine
+          console.log('Calling extraction engine with region:', region);
+          const ocrResult = await extractionEngine.extractFromRegion(pageImagePath, region);
+          console.log('Extraction engine result:', { textLength: ocrResult.text.length, confidence: ocrResult.confidence, type: ocrResult.type });
+          
+          let formattedText = ocrResult.text;
+          
+          // Format structured data if available
+          if (ocrResult.structured && ocrResult.structured.headers.length > 0) {
+            const { headers, rows } = ocrResult.structured;
+            formattedText = formatStructuredData(headers, rows, ocrResult.text);
+            console.log('Structured data formatted with', headers.length, 'headers and', rows.length, 'rows');
+          }
+          
+          extractionResult = {
+            text: formattedText,
+            confidence: ocrResult.confidence,
+            method: 'extraction-engine'
+          };
+          extractionMethod = 'extraction-engine';
+        }
+      }
+
+      console.log(`Extraction completed using method: ${extractionMethod}, confidence: ${extractionResult.confidence}`);
+
+      // Increment user's trial extractions count if they're on the free plan
+      await storage.incrementUserExtractions(req.user.id);
+
+      res.json({
+        text: extractionResult.text,
+        confidence: extractionResult.confidence,
+        extractionMethod: extractionMethod
+      });
+
+    } catch (error) {
+      console.error('Text extraction error:', error);
+      res.status(500).json({ message: 'Failed to extract text from image' });
+    }
+  });
+
+
+
+  // Debug endpoint to test metadata extraction
+  app.post('/api/test-metadata-extraction', async (req, res) => {
+    try {
+      const { drawingId, totalPages } = req.body;
+      console.log('Manual metadata extraction test for drawing:', drawingId, 'pages:', totalPages);
+      
+      const sheetMetadata = await extractAllSheetMetadata(drawingId, totalPages, true);
+      console.log('Extracted metadata:', sheetMetadata.length, 'pages');
+      console.log('Sample metadata:', JSON.stringify(sheetMetadata.slice(0, 2), null, 2));
+      
+      // Try to save to database
+      const updatedDrawing = await storage.updateDrawing(drawingId, {
+        sheetMetadata: sheetMetadata
+      });
+      
+      console.log('Update result:', updatedDrawing ? 'Success' : 'Failed');
+      
+      res.json({
+        success: true,
+        metadataCount: sheetMetadata.length,
+        updateResult: updatedDrawing ? 'success' : 'failed',
+        sampleMetadata: sheetMetadata.slice(0, 2)
+      });
+    } catch (error) {
+      console.error('Manual metadata extraction error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  const httpServer = createServer(app);
+
+
+  // User profile management routes
+  app.get('/api/users/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const user = await storage.getUser(id);
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      res.json(user);
+    } catch (error) {
+      console.error('Failed to get user:', error);
+      res.status(500).json({ message: 'Failed to get user' });
+    }
+  });
+
+  app.patch('/api/users/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const updateData = req.body;
+      
+      // Validate required fields for password change
+      if (updateData.newPassword) {
+        if (!updateData.currentPassword) {
+          return res.status(400).json({ message: 'Current password required for password change' });
+        }
+        
+        // Verify current password
+        const user = await storage.getUser(id);
+        if (!user) {
+          return res.status(404).json({ message: 'User not found' });
+        }
+        
+        const isValidPassword = await storage.verifyPassword(updateData.currentPassword, user.passwordHash);
+        if (!isValidPassword) {
+          return res.status(400).json({ message: 'Current password is incorrect' });
+        }
+        
+        // Replace newPassword with password for storage
+        updateData.password = updateData.newPassword;
+        delete updateData.newPassword;
+        delete updateData.currentPassword;
+      }
+      
+      const updatedUser = await storage.updateUser(id, updateData);
+      if (!updatedUser) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      
+      res.json(updatedUser);
+    } catch (error) {
+      console.error('Failed to update user:', error);
+      res.status(500).json({ message: 'Failed to update user' });
+    }
+  });
+
+  app.delete('/api/users/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      console.log(`API: Attempting to delete user ID: ${id}`);
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ message: 'Invalid user ID' });
+      }
+      
+      // First check if user exists
+      const existingUser = await storage.getUser(id);
+      if (!existingUser) {
+        console.log(`API: User ID ${id} not found`);
+        return res.status(404).json({ message: 'User not found' });
+      }
+      
+      const deleted = await storage.deleteUser(id);
+      if (!deleted) {
+        console.log(`API: User ID ${id} deletion failed`);
+        return res.status(500).json({ message: 'Failed to delete user' });
+      }
+      
+      console.log(`API: Successfully deleted user ID: ${id}`);
+      res.status(204).send();
+    } catch (error) {
+      console.error('API: Failed to delete user:', error);
+      console.error('API: Error details:', {
+        message: error instanceof Error ? error.message : 'Unknown error',
+        stack: error instanceof Error ? error.stack : 'No stack trace',
+        name: error instanceof Error ? error.name : 'Unknown error type'
+      });
+      
+      // Return a more specific error message
+      const errorMessage = error instanceof Error ? error.message : 'Unknown database error';
+      res.status(500).json({ 
+        message: 'Failed to delete user',
+        error: errorMessage,
+        details: 'Please check server logs for more information'
+      });
+    }
+  });
+
+  // AI status endpoint  
+  app.get('/api/ai-status', async (req, res) => {
+    try {
+      const hasApiKey = !!process.env.ANTHROPIC_API_KEY;
+      const featureToggles = await storage.getFeatureToggles();
+      const isAiFeatureEnabled = featureToggles['ai-extraction'] !== undefined ? featureToggles['ai-extraction'] : hasApiKey;
+      
+      const aiEnabled = hasApiKey && isAiFeatureEnabled;
+      
+      res.json({ 
+        aiEnabled, 
+        provider: aiEnabled ? 'Anthropic Claude' : null,
+        model: aiEnabled ? 'claude-sonnet-4-20250514' : null,
+        capabilities: aiEnabled ? [
+          'Auto-extraction with highlighting',
+          'Learning from manual corrections',  
+          'Context-aware analysis',
+          'Construction document understanding'
+        ] : []
+      });
+    } catch (error) {
+      console.error('Error getting AI status:', error);
+      res.status(500).json({ error: 'Failed to get AI status' });
+    }
+  });
+
+  // AI Training endpoints
+  // AI training example endpoint
+  app.post('/api/ai/training/add-example', async (req, res) => {
+    try {
+      await aiTrainingService.addTrainingExample(req.body);
+      res.json({ success: true, message: 'Training example stored' });
+    } catch (error) {
+      console.error('Failed to store training example:', error);
+      res.status(500).json({ success: false, message: 'Failed to store training example' });
+    }
+  });
+
+  // Get training examples for dashboard
+  app.get('/api/ai/training/examples', async (req, res) => {
+    try {
+      const examples = await storage.getTrainingExamples();
+      res.json({ examples });
+    } catch (error) {
+      console.error('Failed to fetch training examples:', error);
+      res.status(500).json({ error: 'Failed to fetch training examples' });
+    }
+  });
+
+  app.post('/api/ai/auto-analyze/:drawingId', async (req, res) => {
+    try {
+      const drawingId = parseInt(req.params.drawingId);
+      const { page = 1 } = req.body;
+      const drawing = await storage.getDrawing(drawingId);
+      
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      // Check if AI extraction is enabled
+      const featureToggles = await storage.getFeatureToggles();
+      if (!featureToggles['ai-extraction']) {
+        return res.status(403).json({ message: 'AI extraction feature is disabled' });
+      }
+
+      // Get drawing profile for context
+      const profile = await storage.getDrawingProfile(drawingId);
+      
+      // Find the specified page image
+      const imagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${page}.png`);
+      
+      if (!fs.existsSync(imagePath)) {
+        return res.status(404).json({ message: 'Drawing image not found' });
+      }
+
+      // Get all construction divisions for AI assignment suggestions
+      const divisions = await storage.getConstructionDivisions();
+
+      // Use AI to analyze and suggest highlighted areas for user review
+      const aiTrainingService = new AITrainingService();
+      const result = await aiTrainingService.performAutoAnalysis(imagePath, divisions, profile, page);
+      
+      if (result) {
+        res.json({
+          highlightedAreas: result.highlightedAreas || [],
+          suggestions: result.suggestions || 'AI has identified potential data areas for your review.',
+          page: page,
+          totalAreas: result.highlightedAreas?.length || 0
+        });
+      } else {
+        res.status(500).json({ message: 'AI auto-analysis failed' });
+      }
+    } catch (error) {
+      console.error('Error in AI auto-extraction:', error);
+      res.status(500).json({ message: 'Failed to perform AI auto-extraction' });
+    }
+  });
+
+  app.post('/api/ai/learn-correction', async (req, res) => {
+    try {
+      const { originalText, correctedText, region, context, divisionId, drawingId } = req.body;
+      
+      // Store the learning data in the database
+      await storage.createManualCorrection({
+        originalExtraction: originalText,
+        correctedExtraction: correctedText,
+        drawingId: drawingId,
+        region: JSON.stringify(region),
+        correctionType: 'text_correction',
+        notes: `Context: ${context}, Division: ${divisionId}`
+      });
+
+      console.log('AI learned from manual correction:', { originalText, correctedText, context });
+
+      res.json({ success: true, message: 'AI has learned from your correction and will improve future extractions' });
+    } catch (error) {
+      console.error('Error in AI learning:', error);
+      res.status(500).json({ message: 'Failed to process correction learning' });
+    }
+  });
+
+  // AI edge refinement endpoint for precise marquee boundaries
+  app.post('/api/ai/refine-edges', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const { drawingId, page, region } = req.body;
+      
+      if (!drawingId || !region) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      // Get the page image path
+      const pageImagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${page || 1}.png`);
+      
+      if (!fs.existsSync(pageImagePath)) {
+        return res.status(404).json({ message: 'Page image not found' });
+      }
+
+      // Convert image to base64 for AI processing
+      const imageBuffer = fs.readFileSync(pageImagePath);
+      const base64Image = imageBuffer.toString('base64');
+
+      // Use AI to refine the edges WITH CREDIT TRACKING
+      const prompt = `Analyze this construction drawing region and provide precise edge coordinates for the visible table or data area.
+      
+      Current selection: x=${region.x}, y=${region.y}, width=${region.width}, height=${region.height}
+      
+      Examine the borders, lines, and text boundaries to provide refined coordinates that exactly match the visible data area.
+      
+      Return JSON format:
+      {
+        "refinedRegion": {
+          "x": refined_x_coordinate,
+          "y": refined_y_coordinate, 
+          "width": refined_width,
+          "height": refined_height
+        },
+        "confidence": 0.95,
+        "improvements": "description of adjustments made"
+      }`;
+
+      // Use credit tracking service for edge refinement
+      const aiResult = await AiCreditService.processAiRequest(
+        req.user.id,
+        'edge_refinement',
+        prompt,
+        undefined,
+        'claude-sonnet-4-20250514'
+      );
+
+      if (aiResult.success && aiResult.response) {
+        try {
+          const result = JSON.parse(aiResult.response);
+          console.log('AI edge refinement successful:', { 
+            cost: aiResult.cost, 
+            tokens: aiResult.tokensUsed,
+            improvements: result.improvements 
+          });
+          
+          res.json({
+            success: true,
+            refinedRegion: result.refinedRegion,
+            confidence: result.confidence,
+            improvements: result.improvements,
+            cost: aiResult.cost
+          });
+        } catch (parseError) {
+          console.error('Failed to parse AI refinement response:', parseError);
+          res.status(500).json({ error: 'Failed to parse AI response' });
+        }
+      } else {
+        res.status(500).json({ error: aiResult.error || 'AI refinement failed' });
+      }
+    } catch (error) {
+      console.error('Error in AI edge refinement:', error);
+      res.status(500).json({ error: 'Failed to refine edges' });
+    }
+  });
+
+  // Smart Extraction - Unified AI Analysis Route
+  app.post('/api/ai/smart-extract/:drawingId', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const drawingId = parseInt(req.params.drawingId);
+      const { page = 1 } = req.body;
+      
+      if (isNaN(drawingId)) {
+        return res.status(400).json({ error: 'Invalid drawing ID' });
+      }
+
+      const drawing = await storage.getDrawing(drawingId);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      // Check if AI extraction is enabled
+      const featureToggles = await storage.getFeatureToggles();
+      if (!featureToggles['ai-extraction']) {
+        return res.status(403).json({ message: 'AI extraction feature is disabled' });
+      }
+
+      // Find the specified page image
+      const imagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${page}.png`);
+      
+      if (!fs.existsSync(imagePath)) {
+        return res.status(404).json({ message: 'Drawing image not found' });
+      }
+
+      // Get drawing profile and metadata for context
+      const profile = await storage.getDrawingProfile(drawingId);
+      let sheetMetadata = null;
+      try {
+        if (drawing.sheetMetadata) {
+          // Check if it's already parsed (object) or needs parsing (string)
+          if (typeof drawing.sheetMetadata === 'string') {
+            sheetMetadata = JSON.parse(drawing.sheetMetadata);
+          } else {
+            sheetMetadata = drawing.sheetMetadata;
+          }
+        }
+      } catch (error) {
+        console.error('Failed to parse sheet metadata:', error);
+        sheetMetadata = null;
+      }
+      const pageMetadata = sheetMetadata?.find((sheet: any) => sheet.pageNumber === page);
+
+      const drawingMetadata = {
+        sheetNumber: pageMetadata?.sheetNumber || `Sheet ${page}`,
+        sheetName: pageMetadata?.sheetTitle || pageMetadata?.displayLabel || drawing.name,
+        scale: pageMetadata?.scale,
+        discipline: pageMetadata?.discipline || profile?.industry
+      };
+
+      // Get available construction divisions
+      const divisions = await storage.getConstructionDivisions();
+
+      console.log(`Starting smart extraction for drawing ${drawingId}, page ${page}`);
+
+      // Perform comprehensive extraction (Smart Extraction + Enhanced NLP) using credit tracking
+      const { AiCreditService } = await import('./ai-credit-service');
+      const { SmartExtractionService } = await import('./smart-extraction-service');
+      const smartExtractor = new SmartExtractionService();
+      
+      // Read and process image for comprehensive analysis
+      const imageBuffer = fs.readFileSync(imagePath);
+      const base64Image = imageBuffer.toString('base64');
+      
+      // Perform OCR first for text extraction
+      const ocrResult = await smartExtractor.performOCR(imagePath);
+      const ocrText = ocrResult || '';
+      
+      console.log(`Performing comprehensive extraction: Smart Extraction + Enhanced NLP for ${drawingMetadata.sheetNumber}`);
+      
+      const analysisResult = await AiCreditService.processAiRequest(
+        req.user.id,
+        'comprehensive_extraction',
+        `Comprehensive extraction (Smart + NLP) for ${drawingMetadata.sheetNumber}`,
+        async () => {
+          // Use the new combined analysis method
+          return await smartExtractor.performCombinedAnalysis(
+            ocrText,
+            base64Image,
+            divisions,
+            drawingMetadata
+          );
+        },
+        'claude-sonnet-4-20250514'
+      );
+
+      if (!analysisResult.success) {
+        return res.status(402).json({ 
+          error: analysisResult.error,
+          creditsRequired: true 
+        });
+      }
+
+      const result = analysisResult.response;
+      
+      // Extract the smart extraction results from the comprehensive analysis
+      const smartExtraction = result.smartExtraction || result;
+      const enhancedNLP = result.enhancedNLP || null;
+      const combinedInsights = result.combinedInsights || null;
+      
+      console.log(`Comprehensive extraction completed: found ${smartExtraction.extractedItems?.length || 0} items, ${enhancedNLP?.data?.summary?.totalRequirements || 0} requirements`);
+      
+      // Store extracted items in the database (from smart extraction)
+      const savedItems = [];
+      if (smartExtraction.extractedItems) {
+        for (const item of smartExtraction.extractedItems) {
+          try {
+            const extractedData = await storage.createExtractedData({
+              drawingId,
+              divisionId: item.csiDivision.id,
+              type: 'comprehensive_extraction',
+              sourceLocation: `${item.location.sheetNumber} (${item.location.coordinates.x},${item.location.coordinates.y})`,
+              data: JSON.stringify({
+                itemName: item.itemName,
+                category: item.category,
+                location: item.location,
+                data: item.data,
+                confidence: item.confidence,
+                calloutId: item.calloutId,
+                // Include Enhanced NLP context if available
+                nlpContext: enhancedNLP?.success ? {
+                  requirements: enhancedNLP.data.requirements?.filter((req: any) => 
+                    req.content.toLowerCase().includes(item.itemName.toLowerCase().split(' ')[0])
+                  ),
+                  compliance: enhancedNLP.data.compliance?.filter((comp: any) => 
+                    comp.requirement.toLowerCase().includes(item.category)
+                  )
+                } : null
+              })
+            });
+            savedItems.push(extractedData);
+          } catch (error) {
+            console.error('Failed to save extracted item:', error);
+          }
+        }
+      }
+
+      res.json({
+        success: true,
+        result: {
+          // Smart extraction results (for backward compatibility)
+          ...smartExtraction,
+          savedItemsCount: savedItems.length,
+          // Enhanced NLP results
+          enhancedNLP: enhancedNLP,
+          combinedInsights: combinedInsights,
+          // Analysis type indicator
+          analysisType: 'comprehensive',
+          capabilities: ['Smart Extraction', 'Enhanced NLP', 'OCR', 'AI Analysis']
+        },
+        cost: analysisResult.cost,
+        tokensUsed: analysisResult.tokensUsed
+      });
+
+    } catch (error) {
+      console.error('Smart extraction error:', error);
+      res.status(500).json({ error: 'Smart extraction failed' });
+    }
+  });
+
+  // Bulk Smart Extraction - Extract from all pages
+  app.post('/api/ai/bulk-extract/:drawingId', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+
+      const drawingId = parseInt(req.params.drawingId);
+      const drawing = await storage.getDrawing(drawingId);
+      
+      if (!drawing) {
+        return res.status(404).json({ error: 'Drawing not found' });
+      }
+
+      const availableDivisions = await storage.getConstructionDivisions();
+      const { SmartExtractionService } = await import('./smart-extraction-service');
+      const smartExtractionService = new SmartExtractionService();
+      
+      // Check if bulk extraction is already in progress
+      const currentStatus = smartExtractionService.getBulkExtractionStatus();
+      if (currentStatus.isProcessing) {
+        return res.status(409).json({ 
+          error: 'Bulk extraction already in progress', 
+          status: currentStatus 
+        });
+      }
+
+      // Start bulk extraction asynchronously
+      const saveToDatabase = async (extractedItems: any[]) => {
+        const savePromises = extractedItems.map(async (item) => {
+          try {
+            // Prepare the data to match the schema structure
+            const itemData = {
+              itemName: item.itemName,
+              category: item.category,
+              procurementData: item.procurementData,
+              location: item.location,
+              confidence: item.confidence || 0.8,
+              calloutId: item.calloutId || `Item ${Math.random().toString(36).substr(2, 9)}`
+            };
+            
+            const sourceLocationData = {
+              coordinates: item.location?.coordinates || { x: 0, y: 0, width: 100, height: 50 },
+              sheetNumber: item.location?.sheetNumber || "Sheet 1",
+              sheetName: item.location?.sheetName || "Unknown",
+              zone: item.location?.zone || "Drawing Area"
+            };
+            
+            const extractedData = await storage.createExtractedData({
+              drawingId,
+              divisionId: item.csiDivision.id,
+              type: 'smart_extraction',
+              sourceLocation: `${sourceLocationData.sheetNumber} (${sourceLocationData.coordinates.x},${sourceLocationData.coordinates.y})`,
+              data: JSON.stringify(itemData),
+              aiEnhanced: false,
+              confidence: 0,
+              extractionMethod: 'ocr',
+              suggestions: null,
+              manuallyCorreted: false
+            });
+            return extractedData;
+          } catch (error) {
+            console.error('Failed to save extracted item:', error, 'Item data:', item);
+            return null;
+          }
+        });
+        const results = await Promise.allSettled(savePromises);
+        const successful = results.filter(r => r.status === 'fulfilled' && r.value).length;
+        console.log(`Saved ${successful}/${extractedItems.length} items to database`);
+      };
+
+      // Create metadata fetcher function
+      const getDrawingMetadata = async (drawingId: number) => {
+        try {
+          const drawing = await storage.getDrawingById(drawingId);
+          if (!drawing?.sheetMetadata) {
+            return [];
+          }
+          
+          // Parse the sheet metadata JSON and return in expected format
+          const sheetMetadata = typeof drawing.sheetMetadata === 'string' 
+            ? JSON.parse(drawing.sheetMetadata)
+            : drawing.sheetMetadata;
+            
+          return Array.isArray(sheetMetadata) 
+            ? sheetMetadata.map(meta => ({
+                pageNumber: meta.pageNumber || 1,
+                sheetNumber: meta.sheetNumber || null,
+                sheetName: meta.sheetName || null
+              }))
+            : [];
+        } catch (error) {
+          console.warn('Failed to fetch drawing metadata:', error);
+          return [];
+        }
+      };
+
+      // Start bulk extraction in background
+      smartExtractionService.bulkExtractFromDrawing(
+        drawingId,
+        drawing.totalPages || 1,
+        availableDivisions,
+        drawing.fileName || 'Unknown',
+        saveToDatabase,
+        getDrawingMetadata
+      ).catch((error) => {
+        console.error('Bulk extraction background process failed:', error);
+      });
+
+      res.json({ 
+        success: true,
+        message: 'Bulk Smart Extraction started - processing all pages', 
+        status: smartExtractionService.getBulkExtractionStatus() 
+      });
+
+    } catch (error) {
+      console.error('Error starting bulk extraction:', error);
+      res.status(500).json({ error: 'Failed to start bulk extraction' });
+    }
+  });
+
+  // Enhanced NLP Analysis endpoint
+  app.post('/api/ai/enhanced-nlp/:drawingId', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const drawingId = parseInt(req.params.drawingId);
+      const { page = 1 } = req.body;
+      
+      if (isNaN(drawingId)) {
+        return res.status(400).json({ error: 'Invalid drawing ID' });
+      }
+
+      const drawing = await storage.getDrawing(drawingId);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      // Check if AI extraction is enabled
+      const featureToggles = await storage.getFeatureToggles();
+      if (!featureToggles['ai-extraction']) {
+        return res.status(403).json({ message: 'AI extraction feature is disabled' });
+      }
+
+      // Find the specified page image
+      const imagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${page}.png`);
+      
+      if (!fs.existsSync(imagePath)) {
+        return res.status(404).json({ message: 'Drawing image not found' });
+      }
+
+      console.log(`Starting Enhanced NLP analysis for drawing ${drawingId}, page ${page}`);
+
+      // Perform Enhanced NLP analysis using credit tracking
+      const { AiCreditService } = await import('./ai-credit-service');
+      const { SmartExtractionService } = await import('./smart-extraction-service');
+
+      const smartExtractionService = new SmartExtractionService();
+      const creditService = new AiCreditService();
+
+      // Read and convert image to base64
+      const imageBuffer = fs.readFileSync(imagePath);
+      const imageBase64 = imageBuffer.toString('base64');
+
+      // Get OCR text from the image (using existing OCR service)
+      const ocrText = await aiExtractionService.performOCR(imagePath);
+
+      // Perform Enhanced NLP analysis with credit tracking
+      const analysisResult = await creditService.performAnalysisWithCreditTracking(
+        req.user.id,
+        async () => await smartExtractionService.performEnhancedNLPAnalysis(ocrText, imageBase64),
+        'enhanced_nlp',
+        'claude-sonnet-4-20250514'
+      );
+
+      if (!analysisResult.success) {
+        return res.status(500).json({ 
+          error: 'Enhanced NLP analysis failed', 
+          details: analysisResult.error 
+        });
+      }
+
+      res.json({
+        success: true,
+        result: analysisResult.result,
+        cost: analysisResult.cost,
+        tokensUsed: analysisResult.tokensUsed
+      });
+
+    } catch (error) {
+      console.error('Enhanced NLP analysis error:', error);
+      res.status(500).json({ error: 'Enhanced NLP analysis failed' });
+    }
+  });
+
+  // Combined Smart Extraction + Enhanced NLP endpoint
+  app.post('/api/ai/combined-analysis/:drawingId', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const drawingId = parseInt(req.params.drawingId);
+      const { page = 1 } = req.body;
+      
+      if (isNaN(drawingId)) {
+        return res.status(400).json({ error: 'Invalid drawing ID' });
+      }
+
+      const drawing = await storage.getDrawing(drawingId);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      // Check if AI extraction is enabled
+      const featureToggles = await storage.getFeatureToggles();
+      if (!featureToggles['ai-extraction']) {
+        return res.status(403).json({ message: 'AI extraction feature is disabled' });
+      }
+
+      // Find the specified page image
+      const imagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${page}.png`);
+      
+      if (!fs.existsSync(imagePath)) {
+        return res.status(404).json({ message: 'Drawing image not found' });
+      }
+
+      // Get drawing profile and metadata for context
+      const profile = await storage.getDrawingProfile(drawingId);
+      let sheetMetadata = null;
+      try {
+        if (drawing.sheetMetadata) {
+          if (typeof drawing.sheetMetadata === 'string') {
+            sheetMetadata = JSON.parse(drawing.sheetMetadata);
+          } else {
+            sheetMetadata = drawing.sheetMetadata;
+          }
+        }
+      } catch (error) {
+        console.error('Failed to parse sheet metadata:', error);
+        sheetMetadata = null;
+      }
+      const pageMetadata = sheetMetadata?.find((sheet: any) => sheet.pageNumber === page);
+
+      const drawingMetadata = {
+        sheetNumber: pageMetadata?.sheetNumber || `Sheet ${page}`,
+        sheetName: pageMetadata?.sheetTitle || pageMetadata?.displayLabel || drawing.name,
+        scale: pageMetadata?.scale,
+        discipline: pageMetadata?.discipline || profile?.industry
+      };
+
+      // Get available construction divisions
+      const divisions = await storage.getConstructionDivisions();
+
+      console.log(`Starting combined analysis for drawing ${drawingId}, page ${page}`);
+
+      // Perform combined analysis using credit tracking
+      const { AiCreditService } = await import('./ai-credit-service');
+      const { SmartExtractionService } = await import('./smart-extraction-service');
+
+      const smartExtractionService = new SmartExtractionService();
+      const creditService = new AiCreditService();
+
+      // Read and convert image to base64
+      const imageBuffer = fs.readFileSync(imagePath);
+      const imageBase64 = imageBuffer.toString('base64');
+
+      // Get OCR text from the image
+      const ocrText = await aiExtractionService.performOCR(imagePath);
+
+      // Perform combined analysis with credit tracking
+      const analysisResult = await creditService.performAnalysisWithCreditTracking(
+        req.user.id,
+        async () => await smartExtractionService.performCombinedAnalysis(
+          ocrText, 
+          imageBase64, 
+          divisions, 
+          drawingMetadata
+        ),
+        'combined_analysis',
+        'claude-sonnet-4-20250514'
+      );
+
+      if (!analysisResult.success) {
+        return res.status(500).json({ 
+          error: 'Combined analysis failed', 
+          details: analysisResult.error 
+        });
+      }
+
+      // Save Smart Extraction results to database
+      const smartExtractionItems = analysisResult.result.smartExtraction.extractedItems;
+      let savedItems = [];
+
+      for (const item of smartExtractionItems) {
+        try {
+          const itemData = {
+            itemName: item.itemName,
+            category: item.category,
+            procurementData: item.data,
+            location: item.location,
+            confidence: item.confidence || 0.8,
+            calloutId: item.calloutId || `Item ${Math.random().toString(36).substr(2, 9)}`
+          };
+          
+          const sourceLocationData = {
+            coordinates: item.location?.coordinates || { x: 0, y: 0, width: 100, height: 50 },
+            sheetNumber: item.location?.sheetNumber || `Sheet ${page}`,
+            sheetName: item.location?.sheetName || drawingMetadata.sheetName,
+            zone: item.location?.zone || "Drawing Area"
+          };
+          
+          const extractedData = await storage.createExtractedData({
+            drawingId,
+            divisionId: item.csiDivision.id,
+            type: 'combined_analysis',
+            sourceLocation: `${sourceLocationData.sheetNumber} (${sourceLocationData.coordinates.x},${sourceLocationData.coordinates.y})`,
+            data: JSON.stringify(itemData),
+            aiEnhanced: true,
+            confidence: item.confidence || 0.8,
+            extractionMethod: 'ai_enhanced',
+            suggestions: null,
+            manuallyCorreted: false
+          });
+          savedItems.push(extractedData);
+        } catch (error) {
+          console.error('Failed to save extracted item:', error);
+        }
+      }
+
+      res.json({
+        success: true,
+        result: {
+          ...analysisResult.result,
+          savedItemsCount: savedItems.length
+        },
+        cost: analysisResult.cost,
+        tokensUsed: analysisResult.tokensUsed
+      });
+
+    } catch (error) {
+      console.error('Combined analysis error:', error);
+      res.status(500).json({ error: 'Combined analysis failed' });
+    }
+  });
+
+  // Bulk extraction status endpoint
+  app.get('/api/bulk-extraction/status', async (req, res) => {
+    try {
+      const { SmartExtractionService } = await import('./smart-extraction-service.js');
+      const smartExtractionService = new SmartExtractionService();
+      res.json(smartExtractionService.getBulkExtractionStatus());
+    } catch (error) {
+      console.error('Error fetching bulk extraction status:', error);
+      res.status(500).json({ 
+        isProcessing: false, 
+        error: 'Failed to fetch bulk extraction status' 
+      });
+    }
+  });
+
+  // Procore API Integration Routes
+  // Legacy Procurement Analysis AI Routes (Deprecated - use smart extraction instead)
+  app.post('/api/ai/analyze-procurement/:drawingId', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const drawingId = parseInt(req.params.drawingId);
+      const { page = 1, includeCostEstimates = false } = req.body;
+      
+      if (isNaN(drawingId)) {
+        return res.status(400).json({ error: 'Invalid drawing ID' });
+      }
+
+      const drawing = await storage.getDrawing(drawingId);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      // Check if AI extraction is enabled
+      const featureToggles = await storage.getFeatureToggles();
+      if (!featureToggles['ai-extraction']) {
+        return res.status(403).json({ message: 'AI extraction feature is disabled' });
+      }
+
+      // Find the specified page image
+      const imagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${page}.png`);
+      
+      if (!fs.existsSync(imagePath)) {
+        return res.status(404).json({ message: 'Drawing image not found' });
+      }
+
+      // Get drawing profile and metadata for context
+      const profile = await storage.getDrawingProfile(drawingId);
+      const sheetMetadata = drawing.sheetMetadata ? JSON.parse(drawing.sheetMetadata) : null;
+      const pageMetadata = sheetMetadata?.find((sheet: any) => sheet.pageNumber === page);
+
+      const drawingMetadata = {
+        sheetNumber: pageMetadata?.sheetNumber || `Sheet ${page}`,
+        sheetName: pageMetadata?.sheetTitle || pageMetadata?.displayLabel || drawing.name,
+        scale: pageMetadata?.scale,
+        discipline: pageMetadata?.discipline || profile?.industry
+      };
+
+      console.log(`Starting procurement analysis for drawing ${drawingId}, page ${page}`);
+
+      // Perform procurement analysis using credit tracking
+      const { AiCreditService } = await import('./ai-credit-service');
+      
+      const analysisResult = await AiCreditService.processAiRequest(
+        req.user.id,
+        'procurement_analysis',
+        `Procurement analysis for ${drawingMetadata.sheetNumber}`,
+        async () => {
+          return await procurementAnalysisService.analyzeProcurementItems(
+            imagePath,
+            drawingMetadata,
+            req.user.id
+          );
+        },
+        'claude-sonnet-4-20250514'
+      );
+
+      if (!analysisResult.success) {
+        return res.status(402).json({ 
+          error: analysisResult.error,
+          creditsRequired: true 
+        });
+      }
+
+      const result = analysisResult.response as ProcurementAnalysisResult;
+      
+      console.log(`Procurement analysis completed: found ${result.items.length} items`);
+
+      res.json({
+        ...result,
+        page,
+        drawingId,
+        analysisMetadata: {
+          timestamp: new Date().toISOString(),
+          userId: req.user.id,
+          confidenceScore: result.confidence,
+          processingTime: Date.now() // You could track actual processing time
+        }
+      });
+
+    } catch (error) {
+      console.error('Error in procurement analysis:', error);
+      res.status(500).json({ 
+        message: 'Failed to perform procurement analysis',
+        error: error.message 
+      });
+    }
+  });
+
+  app.post('/api/ai/analyze-procurement-multi/:drawingId', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const drawingId = parseInt(req.params.drawingId);
+      const { pages, consolidate = true } = req.body;
+      
+      if (isNaN(drawingId)) {
+        return res.status(400).json({ error: 'Invalid drawing ID' });
+      }
+
+      if (!pages || !Array.isArray(pages) || pages.length === 0) {
+        return res.status(400).json({ error: 'Pages array is required' });
+      }
+
+      const drawing = await storage.getDrawing(drawingId);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      // Check if AI extraction is enabled
+      const featureToggles = await storage.getFeatureToggles();
+      if (!featureToggles['ai-extraction']) {
+        return res.status(403).json({ message: 'AI extraction feature is disabled' });
+      }
+
+      // Prepare sheet data for analysis
+      const sheetMetadata = drawing.sheetMetadata ? JSON.parse(drawing.sheetMetadata) : null;
+      const sheetsToAnalyze = [];
+
+      for (const pageNum of pages) {
+        const imagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${pageNum}.png`);
+        
+        if (fs.existsSync(imagePath)) {
+          const pageMetadata = sheetMetadata?.find((sheet: any) => sheet.pageNumber === pageNum);
+          sheetsToAnalyze.push({
+            path: imagePath,
+            sheetNumber: pageMetadata?.sheetNumber || `Sheet ${pageNum}`,
+            sheetName: pageMetadata?.sheetTitle || pageMetadata?.displayLabel || `Page ${pageNum}`
+          });
+        }
+      }
+
+      if (sheetsToAnalyze.length === 0) {
+        return res.status(404).json({ message: 'No valid sheet images found' });
+      }
+
+      console.log(`Starting multi-sheet procurement analysis for ${sheetsToAnalyze.length} sheets`);
+
+      // Use AI credit tracking for multi-sheet analysis
+      const { AiCreditService } = await import('./ai-credit-service');
+      
+      const analysisResult = await AiCreditService.processAiRequest(
+        req.user.id,
+        'multi_sheet_procurement_analysis',
+        `Multi-sheet procurement analysis for ${sheetsToAnalyze.length} sheets`,
+        async () => {
+          return await procurementAnalysisService.analyzeProcurementAcrossSheets(
+            sheetsToAnalyze,
+            req.user.id
+          );
+        },
+        'claude-sonnet-4-20250514'
+      );
+
+      if (!analysisResult.success) {
+        return res.status(402).json({ 
+          error: analysisResult.error,
+          creditsRequired: true 
+        });
+      }
+
+      const result = analysisResult.response;
+      
+      console.log(`Multi-sheet analysis completed: ${result.consolidatedItems.length} unique items, ${result.summary.duplicates} duplicates`);
+
+      res.json({
+        ...result,
+        drawingId,
+        analysisMetadata: {
+          timestamp: new Date().toISOString(),
+          userId: req.user.id,
+          sheetsAnalyzed: sheetsToAnalyze.length,
+          pagesProcessed: pages
+        }
+      });
+
+    } catch (error) {
+      console.error('Error in multi-sheet procurement analysis:', error);
+      res.status(500).json({ 
+        message: 'Failed to perform multi-sheet procurement analysis',
+        error: error.message 
+      });
+    }
+  });
+
+  // Division extraction route - extracts data directly into construction divisions
+  app.post('/api/ai/extract-to-divisions/:drawingId', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const drawingId = parseInt(req.params.drawingId);
+      const { page = 1 } = req.body;
+      
+      if (isNaN(drawingId)) {
+        return res.status(400).json({ error: 'Invalid drawing ID' });
+      }
+
+      const drawing = await storage.getDrawing(drawingId);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      // Check if AI extraction is enabled
+      const featureToggles = await storage.getFeatureToggles();
+      if (!featureToggles['ai-extraction']) {
+        return res.status(403).json({ message: 'AI extraction feature is disabled' });
+      }
+
+      // Find the specified page image
+      const imagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${page}.png`);
+      
+      if (!fs.existsSync(imagePath)) {
+        return res.status(404).json({ message: 'Drawing image not found' });
+      }
+
+      // Get available construction divisions
+      const availableDivisions = await storage.getConstructionDivisions();
+      
+      // Get drawing profile and metadata for context
+      const profile = await storage.getDrawingProfile(drawingId);
+      let sheetMetadata = null;
+      try {
+        sheetMetadata = drawing.sheetMetadata ? JSON.parse(drawing.sheetMetadata) : null;
+      } catch (error) {
+        console.log('Failed to parse sheetMetadata, using defaults:', error.message);
+        sheetMetadata = null;
+      }
+      const pageMetadata = sheetMetadata?.find((sheet: any) => sheet.pageNumber === page);
+
+      const drawingMetadata = {
+        sheetNumber: pageMetadata?.sheetNumber || `Sheet ${page}`,
+        sheetName: pageMetadata?.sheetTitle || pageMetadata?.displayLabel || drawing.name,
+        scale: pageMetadata?.scale,
+        discipline: pageMetadata?.discipline || profile?.industry
+      };
+
+      console.log(`Starting division extraction for drawing ${drawingId}, page ${page}`);
+
+      // Perform division extraction using credit tracking
+      const { AiCreditService } = await import('./ai-credit-service');
+      const { divisionExtractionService } = await import('./division-extraction-service');
+      
+      console.log('Available divisions:', availableDivisions.length);
+      console.log('Drawing metadata:', drawingMetadata);
+      console.log('Image path:', imagePath);
+      
+      const extractionResult = await AiCreditService.processAiRequest(
+        req.user.id,
+        'text_extraction',
+        `Division extraction for ${drawingMetadata.sheetNumber}`,
+        async () => {
+          console.log('Calling division extraction service...');
+          return await divisionExtractionService.extractToConstructionDivisions(
+            imagePath,
+            availableDivisions,
+            drawingMetadata,
+            req.user.id
+          );
+        },
+        'claude-sonnet-4-20250514'
+      );
+
+      if (!extractionResult.success) {
+        return res.status(402).json({ 
+          error: extractionResult.error,
+          creditsRequired: true 
+        });
+      }
+
+      const result = extractionResult.response;
+      
+      // Store extracted data in the database
+      const storedData = [];
+      for (const divisionData of result.extractedData) {
+        for (const item of divisionData.items) {
+          const extractedDataItem = await storage.createExtractedData({
+            drawingId,
+            divisionId: divisionData.divisionId,
+            type: 'mixed',
+            sourceLocation: JSON.stringify(item.location?.coordinates || {}),
+            data: JSON.stringify({
+              name: item.name,
+              description: item.description,
+              quantity: item.quantity,
+              specifications: item.specifications,
+              location: item.location
+            }),
+            aiEnhanced: true,
+            confidence: item.confidence,
+            extractionMethod: 'ai_division_extraction'
+          });
+          storedData.push(extractedDataItem);
+        }
+      }
+      
+      console.log(`Division extraction completed: found ${result.summary.totalItems} items across ${result.summary.divisionsFound} divisions`);
+
+      res.json({
+        success: true,
+        extractedData: result.extractedData,
+        summary: result.summary,
+        drawingMetadata: result.drawingMetadata,
+        storedItems: storedData.length,
+        page,
+        drawingId,
+        analysisMetadata: {
+          timestamp: new Date().toISOString(),
+          userId: req.user.id,
+          extractionMethod: 'ai_division_extraction'
+        }
+      });
+
+    } catch (error) {
+      console.error('Error in division extraction:', error);
+      res.status(500).json({ 
+        message: 'Failed to perform division extraction',
+        error: error.message 
+      });
+    }
+  });
+
+  // Procurement extraction route - NEW: extracts procurement items with CSI classification and drawing annotations
+  app.post('/api/ai/extract-procurement/:drawingId', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const drawingId = parseInt(req.params.drawingId);
+      const { page = 1 } = req.body;
+      
+      if (isNaN(drawingId)) {
+        return res.status(400).json({ error: 'Invalid drawing ID' });
+      }
+
+      const drawing = await storage.getDrawing(drawingId);
+      if (!drawing) {
+        return res.status(404).json({ message: 'Drawing not found' });
+      }
+
+      // Check if AI extraction is enabled
+      const featureToggles = await storage.getFeatureToggles();
+      if (!featureToggles['ai-extraction']) {
+        return res.status(403).json({ message: 'AI extraction feature is disabled' });
+      }
+
+      // Use the PDF file path directly - images will be generated on demand
+      const pdfPath = drawing.filePath;
+
+      // Get available construction divisions
+      const availableDivisions = await storage.getConstructionDivisions();
+      
+      // Get drawing profile and metadata for context
+      const profile = await storage.getDrawingProfile(drawingId);
+      let sheetMetadata = null;
+      try {
+        sheetMetadata = drawing.sheetMetadata ? JSON.parse(drawing.sheetMetadata) : null;
+      } catch (error) {
+        console.log('Failed to parse sheetMetadata, using defaults:', error.message);
+        sheetMetadata = null;
+      }
+      const pageMetadata = sheetMetadata?.find((sheet: any) => sheet.pageNumber === page);
+
+      const drawingMetadata = {
+        sheetNumber: pageMetadata?.sheetNumber || `Sheet ${page}`,
+        sheetName: pageMetadata?.sheetTitle || pageMetadata?.displayLabel || drawing.name,
+        scale: pageMetadata?.scale,
+        discipline: pageMetadata?.discipline || profile?.industry
+      };
+
+      console.log(`Starting procurement extraction for drawing ${drawingId}, page ${page}`);
+
+      // Perform procurement extraction using credit tracking
+      const { AiCreditService } = await import('./ai-credit-service');
+      const { procurementExtractionService } = await import('./procurement-extraction-service');
+      
+      console.log('Available divisions:', availableDivisions.length);
+      console.log('Drawing metadata:', drawingMetadata);
+      console.log('PDF path:', pdfPath);
+      
+      const extractionResult = await AiCreditService.processAiRequest(
+        req.user.id,
+        'procurement_extraction',
+        `Procurement extraction for ${drawingMetadata.sheetNumber}`,
+        async () => {
+          console.log('Calling procurement extraction service...');
+          return await procurementExtractionService.extractProcurementItems(
+            pdfPath,
+            page,
+            availableDivisions,
+            drawingMetadata
+          );
+        },
+        'claude-sonnet-4-20250514'
+      );
+
+      if (!extractionResult.success) {
+        return res.status(402).json({ 
+          error: extractionResult.error,
+          creditsRequired: true 
+        });
+      }
+
+      const result = extractionResult.response;
+      
+      // Store extracted procurement items in the database
+      const storedData = [];
+      for (const item of result.extractedItems) {
+        const extractedDataItem = await storage.createExtractedData({
+          drawingId,
+          divisionId: item.csiDivision.id,
+          type: 'procurement',
+          sourceLocation: JSON.stringify({
+            coordinates: item.drawingLocation.coordinates,
+            sheetNumber: item.drawingLocation.sheetNumber,
+            sheetName: item.drawingLocation.sheetName,
+            drawingDetail: item.drawingLocation.drawingDetail,
+            zone: item.drawingLocation.zone
+          }),
+          data: JSON.stringify({
+            itemName: item.itemName,
+            csiDivision: item.csiDivision,
+            quantity: item.quantity,
+            notes: item.notes,
+            specifications: item.specifications,
+            calloutId: item.calloutId,
+            drawingLocation: item.drawingLocation
+          }),
+          aiEnhanced: true,
+          confidence: item.confidence,
+          extractionMethod: 'ai_procurement_extraction'
+        });
+        storedData.push(extractedDataItem);
+      }
+      
+      console.log(`Stored ${storedData.length} procurement items in database`);
+      
+      res.json({
+        success: true,
+        extractedItems: result.extractedItems,
+        summary: result.summary,
+        colorCoding: result.colorCoding,
+        drawingAnnotations: result.drawingAnnotations,
+        drawingMetadata,
+        storedItems: storedData.length,
+        message: `Successfully extracted ${result.summary.totalItems} procurement items across ${result.summary.divisionsFound} CSI divisions`
+      });
+
+    } catch (error) {
+      console.error('Error in procurement extraction:', error);
+      res.status(500).json({ 
+        message: 'Failed to perform procurement extraction',
+        error: error.message 
+      });
+    }
+  });
+
+  app.get('/api/ai/procurement-divisions', async (req, res) => {
+    try {
+      // Return CSI division information for procurement classification
+      const divisions = [
+        { code: "00", name: "Procurement and Contracting", color: "#8B4513" },
+        { code: "01", name: "General Requirements", color: "#2F4F4F" },
+        { code: "02", name: "Existing Conditions", color: "#556B2F" },
+        { code: "03", name: "Concrete", color: "#708090" },
+        { code: "04", name: "Masonry", color: "#CD853F" },
+        { code: "05", name: "Metals", color: "#4682B4" },
+        { code: "06", name: "Wood, Plastics, and Composites", color: "#8B4513" },
+        { code: "07", name: "Thermal and Moisture Protection", color: "#FF4500" },
+        { code: "08", name: "Openings", color: "#32CD32" },
+        { code: "09", name: "Finishes", color: "#FF69B4" },
+        { code: "10", name: "Specialties", color: "#9932CC" },
+        { code: "11", name: "Equipment", color: "#FF6347" },
+        { code: "12", name: "Furnishings", color: "#20B2AA" },
+        { code: "13", name: "Special Construction", color: "#F0E68C" },
+        { code: "14", name: "Conveying Equipment", color: "#DDA0DD" },
+        { code: "21", name: "Fire Suppression", color: "#DC143C" },
+        { code: "22", name: "Plumbing", color: "#4169E1" },
+        { code: "23", name: "Heating, Ventilating, and Air Conditioning", color: "#00CED1" },
+        { code: "25", name: "Integrated Automation", color: "#FFD700" },
+        { code: "26", name: "Electrical", color: "#FF8C00" },
+        { code: "27", name: "Communications", color: "#9370DB" },
+        { code: "28", name: "Electronic Safety and Security", color: "#FF1493" },
+        { code: "31", name: "Earthwork", color: "#8B7355" },
+        { code: "32", name: "Exterior Improvements", color: "#228B22" },
+        { code: "33", name: "Utilities", color: "#4682B4" },
+        { code: "34", name: "Transportation", color: "#696969" },
+        { code: "35", name: "Waterway and Marine Construction", color: "#008B8B" }
+      ];
+
+      res.json({
+        divisions,
+        colorScheme: divisions.reduce((acc, div) => {
+          acc[div.code] = div.color;
+          return acc;
+        }, {} as Record<string, string>)
+      });
+    } catch (error) {
+      console.error('Error fetching procurement divisions:', error);
+      res.status(500).json({ error: 'Failed to fetch procurement divisions' });
+    }
+  });
+
+  // Paid features management endpoints
+  app.get('/api/paid-features', async (req, res) => {
+    try {
+      const featureToggles = await storage.getFeatureToggles();
+      
+      const features = [
+        {
+          id: 'ai-extraction',
+          name: 'AI-Enhanced Data Extraction (Anthropic Claude)',
+          description: 'Uses your personal Anthropic API key for intelligent document analysis',
+          costType: 'external_api',
+          costPerUnit: 0.003, // Actual Anthropic pricing per 1K tokens
+          unit: '1K tokens',
+          apiKeyRequired: 'ANTHROPIC_API_KEY',
+          icon: 'Bot',
+          enabled: featureToggles['ai-extraction'] !== undefined ? featureToggles['ai-extraction'] : !!process.env.ANTHROPIC_API_KEY,
+          hasApiKey: !!process.env.ANTHROPIC_API_KEY,
+          category: 'paid_apis',
+          provider: 'Anthropic',
+          estimatedUsage: '100'
+        },
+        {
+          id: 'advanced-ocr',
+          name: 'Advanced OCR Processing (Tesseract.js)',
+          description: 'High-quality OCR with preprocessing, table detection, and spatial analysis',
+          costType: 'free',
+          costPerUnit: 0,
+          unit: 'unlimited',
+          icon: 'Zap',
+          enabled: true, // Always enabled for free features
+          category: 'free_features',
+          estimatedUsage: 'unlimited'
+        },
+        {
+          id: 'pdf-processing',
+          name: 'PDF Processing (Sharp + pdf2pic)',
+          description: 'High-resolution PDF conversion and image processing',
+          costType: 'free',
+          costPerUnit: 0,
+          unit: 'unlimited',
+          icon: 'FileText',
+          enabled: true,
+          category: 'free_features',
+          estimatedUsage: 'unlimited'
+        },
+        {
+          id: 'database-storage',
+          name: 'Database Storage (PostgreSQL)',
+          description: 'Persistent storage for projects, drawings, and extracted data',
+          costType: 'replit_included',
+          costPerUnit: 0,
+          unit: 'included with Replit plan',
+          icon: 'Database',
+          enabled: true,
+          category: 'replit_included',
+          estimatedUsage: 'included'
+        },
+        {
+          id: 'file-storage',
+          name: 'File Storage & Hosting',
+          description: 'Upload and serve PDF files and generated images',
+          costType: 'replit_included',
+          costPerUnit: 0,
+          unit: 'included with Replit plan',
+          icon: 'HardDrive',
+          enabled: true,
+          category: 'replit_included',
+          estimatedUsage: 'included'
+        }
+      ];
+
+      res.json(features);
+    } catch (error) {
+      console.error('Error fetching paid features:', error);
+      res.status(500).json({ error: 'Failed to fetch features' });
+    }
+  });
+
+  app.patch('/api/paid-features/:featureId/toggle', async (req, res) => {
+    const { featureId } = req.params;
+    const { enabled } = req.body;
+
+    try {
+      // Get all features to check if this one can be toggled
+      const featureToggles = await storage.getFeatureToggles();
+      const features = [
+        {
+          id: 'ai-extraction',
+          costType: 'external_api'
+        },
+        {
+          id: 'advanced-ocr',
+          costType: 'free'
+        },
+        {
+          id: 'pdf-processing',
+          costType: 'free'
+        },
+        {
+          id: 'database-storage',
+          costType: 'replit_included'
+        },
+        {
+          id: 'file-storage',
+          costType: 'replit_included'
+        }
+      ];
+
+      const feature = features.find(f => f.id === featureId);
+      
+      // Only allow toggling of paid (external_api) features
+      if (!feature || feature.costType !== 'external_api') {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Only paid features can be toggled. Free features are always enabled.' 
+        });
+      }
+
+      // Store the feature toggle state for paid features only
+      await storage.setFeatureToggle(featureId, enabled);
+      
+      console.log(`Feature ${featureId} ${enabled ? 'enabled' : 'disabled'}`);
+      
+      res.json({ success: true, featureId, enabled });
+    } catch (error) {
+      console.error('Error toggling feature:', error);
+      res.status(500).json({ success: false, error: 'Failed to toggle feature' });
+    }
+  });
+
+  // API Key management endpoints
+  app.get('/api/api-keys', async (req, res) => {
+    try {
+      const apiKeys = [
+        {
+          name: 'ANTHROPIC_API_KEY',
+          description: 'Required for AI-enhanced document analysis and intelligent extraction',
+          required: true,
+          hasKey: !!process.env.ANTHROPIC_API_KEY,
+          provider: 'Anthropic',
+          setupUrl: 'https://console.anthropic.com/settings/keys',
+          estimatedCost: '$0.003-0.015 per 1K tokens (~$0.50-2.00 per document)'
+        }
+      ];
+      
+      res.json(apiKeys);
+    } catch (error) {
+      console.error('Error fetching API keys:', error);
+      res.status(500).json({ error: 'Failed to fetch API keys' });
+    }
+  });
+
+  app.post('/api/api-keys', async (req, res) => {
+    try {
+      const { keyName, keyValue } = req.body;
+      
+      if (!keyName || !keyValue) {
+        return res.status(400).json({ error: 'Key name and value are required' });
+      }
+      
+      // Note: In a real production environment, you would store this securely
+      // For Replit, we can't dynamically set environment variables from code
+      // This would require manual setting in Replit secrets
+      
+      res.json({ 
+        success: true, 
+        message: 'API key would be stored securely. In Replit, please add this to your Secrets tab.',
+        instructions: `Go to the Secrets tab in your Replit and add: ${keyName} = ${keyValue.substring(0, 8)}...`
+      });
+    } catch (error) {
+      console.error('Error updating API key:', error);
+      res.status(500).json({ error: 'Failed to update API key' });
+    }
+  });
+
+  // Template management routes
+  app.get('/api/construction-divisions/:divisionId/template', async (req, res) => {
+    try {
+      const divisionId = parseInt(req.params.divisionId);
+      if (isNaN(divisionId)) {
+        return res.status(400).json({ message: 'Invalid division ID' });
+      }
+
+      const division = await storage.getConstructionDivision(divisionId);
+      if (!division) {
+        return res.status(404).json({ message: 'Division not found' });
+      }
+
+      // Try to parse the extraction template from the division
+      let template = null;
+      if (division.extractionTemplate) {
+        try {
+          template = JSON.parse(division.extractionTemplate);
+        } catch (error) {
+          console.error('Error parsing division template:', error);
+        }
+      }
+
+      // If no custom template, generate intelligent default template for this division
+      if (!template) {
+        const divisionCode = parseInt(division.code);
+        template = ExtractionTemplateService.generateDefaultTemplateForDivision(divisionCode, division.name);
+      }
+
+      res.json(template);
+    } catch (error) {
+      console.error('Error fetching template:', error);
+      res.status(500).json({ message: 'Failed to fetch template' });
+    }
+  });
+
+  app.post('/api/construction-divisions/:divisionId/template', async (req, res) => {
+    try {
+      const divisionId = parseInt(req.params.divisionId);
+      if (isNaN(divisionId)) {
+        return res.status(400).json({ message: 'Invalid division ID' });
+      }
+
+      const template = req.body;
+      
+      // Validate template structure
+      if (!template.name || !template.columns || !Array.isArray(template.columns)) {
+        return res.status(400).json({ message: 'Invalid template structure' });
+      }
+
+      // Store template as JSON string in the division
+      const templateJson = JSON.stringify(template);
+      const updatedDivision = await storage.updateConstructionDivision(divisionId, {
+        extractionTemplate: templateJson
+      });
+
+      if (!updatedDivision) {
+        return res.status(404).json({ message: 'Division not found' });
+      }
+
+      res.json({ message: "Template saved successfully", template });
+    } catch (error) {
+      console.error('Error saving template:', error);
+      res.status(500).json({ message: 'Failed to save template' });
+    }
+  });
+
+  app.delete('/api/construction-divisions/:divisionId/template', async (req, res) => {
+    try {
+      const divisionId = parseInt(req.params.divisionId);
+      if (isNaN(divisionId)) {
+        return res.status(400).json({ message: 'Invalid division ID' });
+      }
+
+      // Remove custom template by setting extractionTemplate to null
+      const updatedDivision = await storage.updateConstructionDivision(divisionId, {
+        extractionTemplate: null
+      });
+
+      if (!updatedDivision) {
+        return res.status(404).json({ message: 'Division not found' });
+      }
+
+      res.json({ success: true, message: 'Template removed' });
+    } catch (error) {
+      console.error('Error removing template:', error);
+      res.status(500).json({ message: 'Failed to remove template' });
+    }
+  });
+
+  app.get('/api/extraction-templates/defaults', async (req, res) => {
+    try {
+      const defaultTemplates = ExtractionTemplateService.getDefaultTemplates();
+      res.json(defaultTemplates);
+    } catch (error) {
+      console.error('Error fetching default templates:', error);
+      res.status(500).json({ message: 'Failed to fetch default templates' });
+    }
+  });
+
+  // Template-based extraction route
+  app.post('/api/extract-with-template', async (req, res) => {
+    try {
+      const { drawingId, pageNumber, divisionId, region } = req.body;
+
+      if (!drawingId || !pageNumber || !divisionId) {
+        return res.status(400).json({ message: 'Missing required parameters' });
+      }
+
+      // Check if AI extraction is enabled
+      const featureToggles = await storage.getFeatureToggles();
+      if (!featureToggles['ai-extraction']) {
+        return res.status(403).json({ message: 'AI extraction feature is disabled' });
+      }
+
+      // Find the page image
+      const imagePath = path.join(process.cwd(), 'uploads', 'pages', `page.${pageNumber}.png`);
+      
+      if (!fs.existsSync(imagePath)) {
+        return res.status(404).json({ message: 'Drawing image not found' });
+      }
+
+      // Use template-based extraction
+      const extractionResult = await aiExtractionService.extractWithTemplate(
+        imagePath,
+        divisionId,
+        region
+      );
+
+      res.json({
+        text: extractionResult.text,
+        confidence: extractionResult.confidence,
+        templateBasedData: extractionResult.templateBasedData,
+        structured: extractionResult.structured
+      });
+
+    } catch (error) {
+      console.error('Template-based extraction error:', error);
+      res.status(500).json({ message: 'Failed to extract with template' });
+    }
+  });
+
+  // Subscription management routes
+  app.get('/api/subscription/plans', async (req, res) => {
+    try {
+      const plans = await storage.getSubscriptionPlans();
+      res.json(plans);
+    } catch (error) {
+      console.error('Error fetching subscription plans:', error);
+      res.status(500).json({ error: 'Failed to fetch subscription plans' });
+    }
+  });
+
+  app.get('/api/subscription/status', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const limits = await storage.checkUserLimits(req.user.id);
+      const user = req.user;
+      
+      res.json({
+        subscriptionStatus: user.subscriptionStatus,
+        subscriptionPlan: user.subscriptionPlan,
+        trialExtractionsUsed: user.trialExtractionsUsed,
+        limits
+      });
+    } catch (error) {
+      console.error('Error fetching subscription status:', error);
+      res.status(500).json({ error: 'Failed to fetch subscription status' });
+    }
+  });
+
+  app.post('/api/subscription/create-checkout', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { planId } = req.body;
+      const plan = await storage.getSubscriptionPlan(planId);
+      const user = req.user;
+      
+      if (!plan) {
+        return res.status(404).json({ error: 'Plan not found' });
+      }
+
+      if (plan.planId === 'free') {
+        return res.status(400).json({ error: 'Cannot create checkout for free plan' });
+      }
+
+      // Create or get Stripe customer
+      let stripeCustomerId = user.stripeCustomerId;
+      if (!stripeCustomerId) {
+        const customer = await stripe.customers.create({
+          email: user.email!,
+          name: user.username,
+          metadata: {
+            userId: user.id.toString(),
+          },
+        });
+        stripeCustomerId = customer.id;
+        
+        // Update user with Stripe customer ID
+        await storage.updateUserSubscription(user.id, {
+          stripeCustomerId: customer.id,
+        });
+      }
+
+      // Create Stripe checkout session
+      const host = req.get('host') || 'localhost:5000';
+      const successUrl = `https://${host}/subscription?success=true&session_id={CHECKOUT_SESSION_ID}`;
+      const cancelUrl = `https://${host}/subscription?canceled=true`;
+      
+      console.log('Creating checkout session with URLs:', { successUrl, cancelUrl, host });
+      
+      const session = await stripe.checkout.sessions.create({
+        customer: stripeCustomerId,
+        payment_method_types: ['card'],
+        mode: 'subscription',
+        line_items: [{
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: plan.name,
+              description: plan.features.join(', '),
+            },
+            unit_amount: Math.round(plan.monthlyPrice * 100), // Convert to cents
+            recurring: {
+              interval: 'month',
+            },
+          },
+          quantity: 1,
+        }],
+        success_url: successUrl,
+        cancel_url: cancelUrl,
+        metadata: {
+          userId: user.id.toString(),
+          planId: plan.planId,
+        },
+      });
+
+      res.json({
+        checkoutUrl: session.url,
+        sessionId: session.id,
+      });
+    } catch (error) {
+      console.error('Error creating checkout session:', error);
+      res.status(500).json({ error: 'Failed to create checkout session' });
+    }
+  });
+
+  // Billing endpoints
+  app.get('/api/billing/payment-methods', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user;
+      
+      if (!user.stripeCustomerId) {
+        return res.json([]);
+      }
+
+      const paymentMethods = await stripe.paymentMethods.list({
+        customer: user.stripeCustomerId,
+        type: 'card',
+      });
+
+      const customer = await stripe.customers.retrieve(user.stripeCustomerId);
+      const defaultPaymentMethodId = customer.invoice_settings?.default_payment_method;
+
+      const formattedMethods = paymentMethods.data.map(method => ({
+        id: method.id,
+        card: method.card,
+        isDefault: method.id === defaultPaymentMethodId,
+        created: method.created,
+      }));
+
+      res.json(formattedMethods);
+    } catch (error) {
+      console.error('Error fetching payment methods:', error);
+      res.status(500).json({ error: 'Failed to fetch payment methods' });
+    }
+  });
+
+  app.post('/api/billing/setup-intent', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user;
+      let stripeCustomerId = user.stripeCustomerId;
+
+      // Create Stripe customer if doesn't exist
+      if (!stripeCustomerId) {
+        const customer = await stripe.customers.create({
+          email: user.email,
+          name: `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.username,
+        });
+        stripeCustomerId = customer.id;
+        
+        // Update user with Stripe customer ID
+        try {
+          await storage.updateUserSubscription(user.id, {
+            stripeCustomerId: stripeCustomerId,
+          });
+        } catch (updateError) {
+          console.error('Error updating user with Stripe customer ID:', updateError);
+          // Continue anyway - we can retry later
+        }
+      }
+
+      // Create setup intent for adding payment method
+      const setupIntent = await stripe.setupIntents.create({
+        customer: stripeCustomerId,
+        payment_method_types: ['card'],
+        usage: 'off_session',
+      });
+
+      const host = req.get('host') || 'localhost:5000';
+      const successUrl = `https://${host}/profile?payment_setup=success`;
+      const cancelUrl = `https://${host}/profile?payment_setup=canceled`;
+
+      // Create a simpler payment method setup flow
+      res.json({
+        clientSecret: setupIntent.client_secret,
+        success: true,
+        message: 'Setup intent created successfully'
+      });
+    } catch (error) {
+      console.error('Error creating setup intent:', error);
+      res.status(500).json({ error: 'Failed to create setup intent' });
+    }
+  });
+
+  app.delete('/api/billing/payment-methods/:paymentMethodId', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { paymentMethodId } = req.params;
+      
+      // Detach payment method from customer
+      await stripe.paymentMethods.detach(paymentMethodId);
+      
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Error removing payment method:', error);
+      res.status(500).json({ error: 'Failed to remove payment method' });
+    }
+  });
+
+  // Contact sales endpoint
+  app.post('/api/contact-sales', async (req, res) => {
+    try {
+      const { name, company, email, phone, message } = req.body;
+      
+      // Basic validation
+      if (!name || !email || !company) {
+        return res.status(400).json({ error: 'Name, email, and company are required' });
+      }
+
+      // Store contact request in database
+      const contactRequest = {
+        name,
+        company,
+        email,
+        phone: phone || null,
+        message: message || null,
+        submittedAt: new Date(),
+        status: 'pending'
+      };
+
+      // Log contact request for now - database storage can be added later
+      
+      console.log('Contact Sales Request:', contactRequest);
+      
+      // You could add email notification here using nodemailer or similar
+      // await sendNotificationEmail(contactRequest);
+      
+      res.json({ 
+        success: true, 
+        message: 'Contact request submitted successfully' 
+      });
+    } catch (error) {
+      console.error('Error processing contact sales request:', error);
+      res.status(500).json({ error: 'Failed to submit contact request' });
+    }
+  });
+
+  // Stripe webhook endpoint
+  app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+      // For development, you can use the webhook without signature verification
+      // In production, you should verify the webhook signature
+      event = stripe.webhooks.constructEvent(req.body, sig!, process.env.STRIPE_WEBHOOK_SECRET || 'dummy_secret');
+    } catch (err) {
+      console.log('Webhook signature verification failed.', err);
+      // For development, parse the event anyway
+      try {
+        event = JSON.parse(req.body);
+      } catch (parseError) {
+        return res.status(400).send(`Webhook Error: ${parseError}`);
+      }
+    }
+
+    try {
+      switch (event.type) {
+        case 'checkout.session.completed':
+          const session = event.data.object;
+          const userId = parseInt(session.metadata.userId);
+          const planId = session.metadata.planId;
+          
+          // Update user subscription status
+          await storage.updateUserSubscription(userId, {
+            subscriptionStatus: 'active',
+            subscriptionPlan: planId,
+            subscriptionStartDate: new Date(),
+            stripeSubscriptionId: session.subscription,
+          });
+          
+          console.log(`Subscription activated for user ${userId}, plan ${planId}`);
+          break;
+
+        case 'invoice.payment_succeeded':
+          // Handle successful subscription renewal
+          const invoice = event.data.object;
+          console.log('Invoice payment succeeded:', invoice.id);
+          break;
+
+        case 'invoice.payment_failed':
+          // Handle failed subscription payment
+          const failedInvoice = event.data.object;
+          console.log('Invoice payment failed:', failedInvoice.id);
+          // Could suspend subscription or notify user
+          break;
+
+        case 'customer.subscription.deleted':
+          // Handle subscription cancellation
+          const subscription = event.data.object;
+          const customerId = subscription.customer;
+          
+          // Find user by Stripe customer ID and update subscription status
+          // Note: This would require a method to find user by stripeCustomerId
+          console.log('Subscription canceled for customer:', customerId);
+          break;
+
+        default:
+          console.log(`Unhandled event type ${event.type}`);
+      }
+
+      res.json({ received: true });
+    } catch (error) {
+      console.error('Error processing webhook:', error);
+      res.status(500).json({ error: 'Webhook processing failed' });
+    }
+  });
+
+  // Drawing Profile routes
+  app.get('/api/drawing-profiles/:drawingId', async (req, res) => {
+    try {
+      const drawingId = parseInt(req.params.drawingId);
+      if (isNaN(drawingId)) {
+        return res.status(400).json({ message: 'Invalid drawing ID' });
+      }
+      
+      const profile = await storage.getDrawingProfile(drawingId);
+      if (!profile) {
+        return res.status(404).json({ message: 'Drawing profile not found' });
+      }
+      
+      res.json(profile);
+    } catch (error) {
+      console.error('Error fetching drawing profile:', error);
+      res.status(500).json({ message: 'Failed to fetch drawing profile' });
+    }
+  });
+
+  app.post('/api/drawing-profiles', async (req, res) => {
+    try {
+      // Convert date strings to Date objects if they exist
+      const profileData = { ...req.body };
+      if (profileData.projectStartDate && typeof profileData.projectStartDate === 'string') {
+        profileData.projectStartDate = new Date(profileData.projectStartDate);
+      }
+      if (profileData.projectEndDate && typeof profileData.projectEndDate === 'string') {
+        profileData.projectEndDate = new Date(profileData.projectEndDate);
+      }
+      
+      const profile = await storage.createDrawingProfile(profileData);
+      res.status(201).json(profile);
+    } catch (error) {
+      console.error('Error creating drawing profile:', error);
+      res.status(500).json({ message: 'Failed to create drawing profile' });
+    }
+  });
+
+  app.put('/api/drawing-profiles/:drawingId', async (req, res) => {
+    try {
+      const drawingId = parseInt(req.params.drawingId);
+      if (isNaN(drawingId)) {
+        return res.status(400).json({ message: 'Invalid drawing ID' });
+      }
+      
+      const profile = await storage.updateDrawingProfile(drawingId, req.body);
+      if (!profile) {
+        return res.status(404).json({ message: 'Drawing profile not found' });
+      }
+      
+      res.json(profile);
+    } catch (error) {
+      console.error('Error updating drawing profile:', error);
+      res.status(500).json({ message: 'Failed to update drawing profile' });
+    }
+  });
+
+  // AI Credit Management endpoints
+  app.get('/api/ai-credits/balance', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const balance = await AiCreditService.getCreditBalance(req.user.id);
+      res.json(balance);
+    } catch (error: any) {
+      console.error('Error fetching credit balance:', error);
+      res.status(500).json({ error: 'Failed to fetch credit balance' });
+    }
+  });
+
+  app.post('/api/ai-credits/add', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { amount, type, description } = req.body;
+      
+      if (!amount || amount <= 0) {
+        return res.status(400).json({ error: 'Invalid amount' });
+      }
+
+      console.log(`Adding ${amount} credits for user ${req.user.id}, type: ${type}, description: ${description}`);
+      
+      // Add credits using the AI Credit Service
+      await AiCreditService.addCredits(
+        req.user.id,
+        amount,
+        type || 'manual_add',
+        description || 'Manual credit addition',
+        null // No payment intent ID for manual additions
+      );
+
+      console.log(`Successfully added ${amount} credits for user ${req.user.id}`);
+      
+      // Return updated balance
+      const balance = await AiCreditService.getCreditBalance(req.user.id);
+      res.json({ success: true, balance });
+    } catch (error: any) {
+      console.error('Error adding credits:', error);
+      res.status(500).json({ error: 'Failed to add credits' });
+    }
+  });
+
+  app.get('/api/ai-credits/payment-method', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const paymentMethod = await AiCreditService.getPaymentMethodInfo(req.user.id);
+      res.json(paymentMethod);
+    } catch (error: any) {
+      console.error('Error fetching payment method:', error);
+      res.status(500).json({ error: 'Failed to fetch payment method' });
+    }
+  });
+
+  app.post('/api/ai-credits/purchase', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { amount } = req.body;
+      if (!amount || amount <= 0) {
+        return res.status(400).json({ error: 'Invalid amount' });
+      }
+
+      // Get or create Stripe customer
+      let stripeCustomerId = req.user.stripeCustomerId;
+      if (!stripeCustomerId) {
+        const customer = await stripe.customers.create({
+          email: req.user.email,
+          name: `${req.user.firstName} ${req.user.lastName}`,
+          metadata: {
+            userId: req.user.id.toString()
+          }
+        });
+        stripeCustomerId = customer.id;
+        
+        // Save customer ID to user record
+        await storage.updateUser(req.user.id, { stripeCustomerId });
+      }
+
+      // Create Stripe Checkout session for credit purchase
+      const sessionData = {
+        payment_method_types: ['card'],
+        customer: stripeCustomerId,
+        line_items: [
+          {
+            price_data: {
+              currency: 'usd',
+              product_data: {
+                name: 'AI Credits',
+                description: `$${amount} in AI processing credits`,
+              },
+              unit_amount: Math.round(amount * 100), // Convert to cents
+            },
+            quantity: 1,
+          },
+        ],
+        mode: 'payment',
+        payment_method_options: {
+          card: {
+            setup_future_usage: 'off_session' // Save payment method for future use
+          }
+        },
+        success_url: `https://${req.get('host')}/ai-credits?payment=success`,
+        cancel_url: `https://${req.get('host')}/ai-credits?payment=cancelled`,
+        metadata: {
+          userId: req.user.id.toString(),
+          type: 'ai_credits',
+          creditAmount: amount.toString()
+        }
+      };
+
+      console.log('Creating Stripe session with data:', JSON.stringify(sessionData, null, 2));
+      
+      const session = await stripe.checkout.sessions.create(sessionData);
+      
+      console.log('Stripe session created successfully:', {
+        id: session.id,
+        url: session.url,
+        customer: session.customer,
+        mode: session.mode
+      });
+
+      res.json({ 
+        sessionId: session.id,
+        url: session.url // Include the URL for debugging
+      });
+    } catch (error: any) {
+      console.error('Error creating credit purchase:', error);
+      res.status(500).json({ error: 'Failed to create credit purchase' });
+    }
+  });
+
+  app.post('/api/ai-credits/webhook', async (req, res) => {
+    // Handle Stripe webhook for successful credit purchases
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || '');
+    } catch (err: any) {
+      console.log(`Webhook signature verification failed.`, err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      
+      if (session.metadata.type === 'ai_credits') {
+        const userId = parseInt(session.metadata.userId);
+        const creditAmount = parseFloat(session.metadata.creditAmount);
+        
+        // Add credits for successful purchase
+        await AiCreditService.addCredits(
+          userId,
+          creditAmount,
+          'purchase',
+          `Credit purchase via Stripe - $${creditAmount}`,
+          session.id
+        );
+
+        // Retrieve the session with expanded payment intent to get payment method
+        try {
+          const expandedSession = await stripe.checkout.sessions.retrieve(session.id, {
+            expand: ['payment_intent']
+          });
+          
+          if (expandedSession.payment_intent && 
+              typeof expandedSession.payment_intent === 'object' && 
+              expandedSession.payment_intent.payment_method) {
+            
+            // Save the payment method for future auto-purchases
+            await AiCreditService.savePaymentMethod(
+              userId,
+              session.customer as string,
+              expandedSession.payment_intent.payment_method as string
+            );
+          }
+        } catch (error) {
+          console.error('Error saving payment method:', error);
+          // Don't fail the transaction if we can't save the payment method
+        }
+      }
+    }
+
+    res.json({ received: true });
+  });
+
+  app.get('/api/ai-credits/usage', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const limit = parseInt(req.query.limit as string) || 50;
+      const usage = await AiCreditService.getUsageHistory(req.user.id, limit);
+      res.json(usage);
+    } catch (error: any) {
+      console.error('Error fetching usage history:', error);
+      res.status(500).json({ error: 'Failed to fetch usage history' });
+    }
+  });
+
+  app.get('/api/ai-credits/transactions', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const limit = parseInt(req.query.limit as string) || 50;
+      const transactions = await AiCreditService.getTransactionHistory(req.user.id, limit);
+      res.json(transactions);
+    } catch (error: any) {
+      console.error('Error fetching transaction history:', error);
+      res.status(500).json({ error: 'Failed to fetch transaction history' });
+    }
+  });
+
+  // AI Credits - Update credit settings
+  app.put('/api/ai-credits/settings', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { alertThreshold, autoPurchase, autoPurchaseAmount } = req.body;
+      
+      const settings: any = {};
+      if (alertThreshold !== undefined) settings.alertThreshold = alertThreshold;
+      if (autoPurchase !== undefined) settings.autoPurchase = autoPurchase;
+      if (autoPurchaseAmount !== undefined) settings.autoPurchaseAmount = autoPurchaseAmount;
+      
+      const updatedBalance = await AiCreditService.updateCreditSettings(req.user.id, settings);
+      res.json(updatedBalance);
+    } catch (error: any) {
+      console.error('Error updating credit settings:', error);
+      res.status(500).json({ error: 'Failed to update settings' });
+    }
+  });
+
+  // Referral system endpoints
+  app.get('/api/referrals/stats', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const stats = await AiCreditService.getReferralStats(req.user.id);
+      res.json(stats);
+    } catch (error: any) {
+      console.error('Error fetching referral stats:', error);
+      res.status(500).json({ error: 'Failed to fetch referral stats' });
+    }
+  });
+
+  app.post('/api/referrals/generate-code', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const referralCode = await AiCreditService.generateReferralCode(req.user.id);
+      res.json({ referralCode });
+    } catch (error: any) {
+      console.error('Error generating referral code:', error);
+      res.status(500).json({ error: 'Failed to generate referral code' });
+    }
+  });
+
+  // Admin routes - restricted to @koncurent.com emails
+  const isAdmin = (req: any, res: any, next: any) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    
+    const userEmail = req.user.email;
+    if (!userEmail || !userEmail.endsWith('@koncurent.com')) {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+    
+    next();
+  };
+
+  // Get all users (admin only)
+  app.get('/api/admin/users', isAdmin, async (req: any, res) => {
+    try {
+      const users = await storage.getAllUsers();
+      res.json(users);
+    } catch (error) {
+      console.error("Error fetching users:", error);
+      res.status(500).json({ message: "Failed to fetch users" });
+    }
+  });
+
+  // Delete user (admin only)
+  app.delete('/api/admin/users/:id', isAdmin, async (req: any, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      console.log(`Admin API: Attempting to delete user ID: ${id}`);
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ message: 'Invalid user ID' });
+      }
+      
+      // First check if user exists
+      const existingUser = await storage.getUser(id);
+      if (!existingUser) {
+        console.log(`Admin API: User ID ${id} not found`);
+        return res.status(404).json({ message: 'User not found' });
+      }
+      
+      // Prevent admin from deleting themselves
+      const currentUserId = req.user?.id;
+      if (currentUserId === id) {
+        return res.status(400).json({ message: 'Cannot delete your own account' });
+      }
+      
+      const deleted = await storage.deleteUser(id);
+      if (!deleted) {
+        console.log(`Admin API: User ID ${id} deletion failed`);
+        return res.status(500).json({ message: 'Failed to delete user' });
+      }
+      
+      console.log(`Admin API: Successfully deleted user ID: ${id} by admin: ${req.user?.email}`);
+      res.status(200).json({ message: 'User successfully deleted' });
+    } catch (error) {
+      console.error('Admin API: Failed to delete user:', error);
+      console.error('Admin API: Error details:', {
+        message: error instanceof Error ? error.message : 'Unknown error',
+        stack: error instanceof Error ? error.stack : 'No stack trace',
+        name: error instanceof Error ? error.name : 'Unknown error type'
+      });
+      
+      // Return a more specific error message
+      const errorMessage = error instanceof Error ? error.message : 'Unknown database error';
+      res.status(500).json({ 
+        message: 'Failed to delete user',
+        error: errorMessage,
+        details: 'Please check server logs for more information'
+      });
+    }
+  });
+
+  // Get credit transactions (admin only)
+  app.get('/api/admin/credit-transactions', isAdmin, async (req: any, res) => {
+    try {
+      const transactions = await storage.getCreditTransactions();
+      res.json(transactions);
+    } catch (error) {
+      console.error("Error fetching transactions:", error);
+      res.status(500).json({ message: "Failed to fetch transactions" });
+    }
+  });
+
+  // Add credits to user (admin only)
+  app.post('/api/admin/add-credits', isAdmin, async (req: any, res) => {
+    try {
+      const { userId, amount, description } = req.body;
+      
+      if (!userId || !amount || !description) {
+        return res.status(400).json({ message: "Missing required fields" });
+      }
+
+      const newBalance = await AiCreditService.addCredits(
+        parseInt(userId),
+        parseFloat(amount),
+        'adjustment',
+        description
+      );
+
+      res.json({ success: true, newBalance });
+    } catch (error) {
+      console.error("Error adding credits:", error);
+      res.status(500).json({ message: "Failed to add credits" });
+    }
+  });
+
+  // Beta invitation system routes
+  app.post("/api/beta/waitlist", async (req, res) => {
+    try {
+      const validatedData = insertWaitlistSchema.parse(req.body);
+      const waitlistEntry = await betaInvitationService.addToWaitlist(validatedData);
+      res.json({ success: true, entry: waitlistEntry });
+    } catch (error) {
+      console.error("Error adding to waitlist:", error);
+      res.status(500).json({ error: "Failed to join waitlist" });
+    }
+  });
+
+  app.get("/api/beta/invitation/:code", async (req, res) => {
+    try {
+      const invitation = await betaInvitationService.getInvitationByCode(req.params.code);
+      if (!invitation) {
+        return res.status(404).json({ error: "Invitation not found" });
+      }
+      res.json(invitation);
+    } catch (error) {
+      console.error("Error fetching invitation:", error);
+      res.status(500).json({ error: "Failed to fetch invitation" });
+    }
+  });
+
+  app.post("/api/beta/accept/:code", async (req, res) => {
+    try {
+      const result = await betaInvitationService.acceptInvitation(req.params.code);
+      res.json(result);
+    } catch (error) {
+      console.error("Error accepting invitation:", error);
+      res.status(500).json({ error: "Failed to accept invitation" });
+    }
+  });
+
+  app.get("/api/beta/access", async (req, res) => {
+    try {
+      const email = req.query.email as string;
+      if (!email) {
+        return res.json({ hasAccess: false });
+      }
+
+      // Check if user has beta access (simplified for now)
+      const user = await storage.getUserByEmail(email);
+      const hasAccess = user?.betaStatus === 'active' || isAdminUser(email);
+      
+      res.json({ hasAccess });
+    } catch (error) {
+      console.error("Error checking beta access:", error);
+      res.json({ hasAccess: false });
+    }
+  });
+
+  // ============= BETA TESTING ADMIN ROUTES =============
+  
+  // Initialize beta feedback table on startup
+  try {
+    await betaFeedbackService.initializeFeedbackTable();
+  } catch (error) {
+    console.error('Error initializing beta feedback table:', error);
+  }
+
+  // Helper function to check if user is beta admin (reusing existing isAdmin function)
+  const isBetaAdmin = (req: any) => {
+    const user = req.user;
+    if (!user || !user.email) return false;
+    
+    const adminEmails = ['mohamed@koncurent.com', 'ryan@koncurent.com', 'kevin@koncurent.com'];
+    return user.email.endsWith('@koncurent.com') && adminEmails.includes(user.email);
+  };
+
+  // BETA FEEDBACK ROUTES
+  
+  // Submit beta feedback (any authenticated user)
+  app.post('/api/beta/feedback', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user;
+      const {
+        feedbackType,
+        category,
+        title,
+        description,
+        severity,
+        reproductionSteps,
+        expectedBehavior,
+        actualBehavior,
+        browserInfo
+      } = req.body;
+
+      if (!feedbackType || !title || !description) {
+        return res.status(400).json({ error: 'Feedback type, title, and description are required' });
+      }
+
+      const feedback = await betaFeedbackService.createFeedback({
+        userId: user.id,
+        userEmail: user.email,
+        feedbackType,
+        category,
+        title,
+        description,
+        severity,
+        reproductionSteps,
+        expectedBehavior,
+        actualBehavior,
+        browserInfo,
+        status: 'open'
+      });
+
+      // Log feedback submission
+      await errorLogger.logUserAction('Beta feedback submitted', user.id?.toString(), user.email, {
+        feedbackId: feedback.id,
+        feedbackType,
+        severity
+      });
+
+      res.status(201).json({ success: true, feedback });
+    } catch (error) {
+      console.error('Error submitting beta feedback:', error);
+      res.status(500).json({ error: 'Failed to submit feedback' });
+    }
+  });
+
+  // Get user's own feedback (any authenticated user)
+  app.get('/api/beta/feedback/my', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user;
+      const feedback = await betaFeedbackService.getFeedback(50, 0, { userId: user.id });
+      res.json(feedback);
+    } catch (error) {
+      console.error('Error fetching user feedback:', error);
+      res.status(500).json({ error: 'Failed to fetch feedback' });
+    }
+  });
+
+  // ADMIN-ONLY BETA MONITORING ROUTES
+
+  // Get all beta feedback (admin only)
+  app.get('/api/beta/admin/feedback', async (req: any, res) => {
+    if (!req.isAuthenticated() || !isBetaAdmin(req)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    try {
+      const { limit = 50, offset = 0, status, feedbackType, category, severity } = req.query;
+      
+      const filters: any = {};
+      if (status) filters.status = status;
+      if (feedbackType) filters.feedbackType = feedbackType;
+      if (category) filters.category = category;
+      if (severity) filters.severity = severity;
+
+      const feedback = await betaFeedbackService.getFeedback(
+        parseInt(limit as string), 
+        parseInt(offset as string), 
+        filters
+      );
+      
+      res.json(feedback);
+    } catch (error) {
+      console.error('Error fetching all feedback:', error);
+      res.status(500).json({ error: 'Failed to fetch feedback' });
+    }
+  });
+
+  // Update feedback status (admin only)
+  app.patch('/api/beta/admin/feedback/:id', async (req: any, res) => {
+    if (!req.isAuthenticated() || !isBetaAdmin(req)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    try {
+      const { id } = req.params;
+      const { status, adminNotes } = req.body;
+      const user = req.user;
+
+      const updated = await betaFeedbackService.updateFeedbackStatus(
+        parseInt(id),
+        status,
+        adminNotes,
+        user.id
+      );
+
+      if (!updated) {
+        return res.status(404).json({ error: 'Feedback not found' });
+      }
+
+      res.json({ success: true, feedback: updated });
+    } catch (error) {
+      console.error('Error updating feedback:', error);
+      res.status(500).json({ error: 'Failed to update feedback' });
+    }
+  });
+
+  // Get beta feedback statistics (admin only)
+  app.get('/api/beta/admin/stats', async (req: any, res) => {
+    if (!req.isAuthenticated() || !isBetaAdmin(req)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    try {
+      const { days = 30 } = req.query;
+      const stats = await betaFeedbackService.getFeedbackStats(parseInt(days as string));
+      res.json(stats);
+    } catch (error) {
+      console.error('Error fetching feedback stats:', error);
+      res.status(500).json({ error: 'Failed to fetch feedback stats' });
+    }
+  });
+
+  // SYSTEM MONITORING ROUTES (admin only)
+
+  // Get system logs
+  app.get('/api/beta/admin/logs', async (req: any, res) => {
+    if (!req.isAuthenticated() || !isBetaAdmin(req)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    try {
+      const { limit = 100 } = req.query;
+      const logs = await errorLogger.getRecentLogs(parseInt(limit as string));
+      res.json(logs);
+    } catch (error) {
+      console.error('Error fetching logs:', error);
+      res.status(500).json({ error: 'Failed to fetch logs' });
+    }
+  });
+
+  // Get error statistics
+  app.get('/api/beta/admin/error-stats', async (req: any, res) => {
+    if (!req.isAuthenticated() || !isBetaAdmin(req)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    try {
+      const { hours = 24 } = req.query;
+      const stats = await errorLogger.getErrorStats(parseInt(hours as string));
+      res.json(stats);
+    } catch (error) {
+      console.error('Error fetching error stats:', error);
+      res.status(500).json({ error: 'Failed to fetch error stats' });
+    }
+  });
+
+  // System health check
+  app.get('/api/beta/admin/health', async (req: any, res) => {
+    if (!req.isAuthenticated() || !isBetaAdmin(req)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    try {
+      const healthData = {
+        timestamp: new Date().toISOString(),
+        server: {
+          uptime: process.uptime(),
+          memory: process.memoryUsage(),
+          nodeVersion: process.version,
+        },
+        database: {
+          connected: true, // We'll assume it's connected if we reach this point
+        },
+        services: {
+          aiService: !!process.env.ANTHROPIC_API_KEY,
+          stripeService: !!process.env.STRIPE_SECRET_KEY,
+          uploadService: true,
+        },
+        environment: process.env.NODE_ENV || 'development',
+      };
+
+      res.json(healthData);
+    } catch (error) {
+      console.error('Error checking system health:', error);
+      res.status(500).json({ error: 'Failed to check system health' });
+    }
+  });
+
+  // Bug report search (admin only)
+  app.get('/api/beta/admin/search-feedback', async (req: any, res) => {
+    if (!req.isAuthenticated() || !isBetaAdmin(req)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    try {
+      const { q } = req.query;
+      if (!q) {
+        return res.status(400).json({ error: 'Search query required' });
+      }
+
+      const results = await betaFeedbackService.searchFeedback(q as string);
+      res.json(results);
+    } catch (error) {
+      console.error('Error searching feedback:', error);
+      res.status(500).json({ error: 'Failed to search feedback' });
+    }
+  });
+
+  // Performance metrics (admin only)
+  app.get('/api/beta/admin/performance', async (req: any, res) => {
+    if (!req.isAuthenticated() || !isBetaAdmin(req)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    try {
+      // Get performance data from the last 24 hours
+      const stats = await errorLogger.getErrorStats(24);
+      
+      // Calculate performance metrics
+      const performanceData = {
+        errorRate: stats.totalErrors,
+        warningRate: stats.totalWarnings,
+        topErrorRoutes: Object.entries(stats.errorsByRoute)
+          .sort(([,a], [,b]) => (b as number) - (a as number))
+          .slice(0, 5),
+        activeUsers: Object.keys(stats.errorsByUser).length,
+        timestamp: new Date().toISOString(),
+      };
+
+      res.json(performanceData);
+    } catch (error) {
+      console.error('Error fetching performance metrics:', error);
+      res.status(500).json({ error: 'Failed to fetch performance metrics' });
+    }
+  });
+
+  // System Health Monitoring (admin only)
+  app.get('/api/beta/admin/system-health', async (req: any, res) => {
+    if (!req.isAuthenticated() || !isBetaAdmin(req)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    try {
+      const process = await import('process');
+      const os = await import('os');
+      const uptime = process.uptime();
+      const memUsage = process.memoryUsage();
+      
+      const systemHealth = {
+        status: 'healthy',
+        uptime: uptime,
+        memory: {
+          used: memUsage.heapUsed,
+          total: memUsage.heapTotal,
+          percentage: (memUsage.heapUsed / memUsage.heapTotal) * 100
+        },
+        cpu: {
+          usage: Math.random() * 50, // Mock CPU usage - in production this would use system monitoring
+          cores: os.cpus().length
+        },
+        database: {
+          status: 'connected',
+          connections: 1 // Mock - in production would query actual DB connection pool
+        },
+        lastUpdate: new Date().toISOString()
+      };
+
+      res.json(systemHealth);
+    } catch (error) {
+      console.error('Error fetching system health:', error);
+      res.status(500).json({ error: 'Failed to fetch system health' });
+    }
+  });
+
+  // User Activity Monitoring (admin only)
+  app.get('/api/beta/admin/user-activity', async (req: any, res) => {
+    if (!req.isAuthenticated() || !isBetaAdmin(req)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    try {
+      const { limit = 10, offset = 0 } = req.query;
+      
+      // Get basic user activity data using storage interface
+      const allUsers = await storage.getAllUsers();
+      const sortedUsers = allUsers
+        .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())
+        .slice(parseInt(offset as string), parseInt(offset as string) + parseInt(limit as string));
+
+      const usersList = sortedUsers.map(user => ({
+        id: user.id,
+        email: user.email,
+        lastActive: user.updatedAt,
+        creditBalance: user.aiCreditsBalance,
+        subscriptionStatus: user.subscriptionStatus
+      }));
+
+      // Get project counts for each user
+      const userActivity = await Promise.all(usersList.map(async (user) => {
+        const userProjects = await storage.getProjectsByUser(user.id);
+        const userExtractions = await storage.getExtractedDataByUser(user.id);
+
+        return {
+          ...user,
+          totalProjects: userProjects.length,
+          totalExtractions: userExtractions.length
+        };
+      }));
+
+      const total = allUsers.length;
+
+      res.json({
+        users: userActivity,
+        total: total
+      });
+    } catch (error) {
+      console.error('Error fetching user activity:', error);
+      res.status(500).json({ error: 'Failed to fetch user activity' });
+    }
+  });
+
+  // REVISION MANAGEMENT ROUTES
+
+  // Drawing Folders
+  // Legacy compatibility route
+  app.get('/api/drawing-folders', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const { projectId } = req.query;
+      const folders = await storage.getDrawingFolders(projectId ? parseInt(projectId) : undefined);
+      res.json(folders);
+    } catch (error) {
+      console.error('Error fetching folders:', error);
+      res.status(500).json({ message: 'Failed to fetch folders' });
+    }
+  });
+
+  app.get('/api/folders', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const { projectId } = req.query;
+      const folders = await storage.getDrawingFolders(projectId ? parseInt(projectId) : undefined);
+      res.json(folders);
+    } catch (error) {
+      console.error('Error fetching folders:', error);
+      res.status(500).json({ message: 'Failed to fetch folders' });
+    }
+  });
+
+  app.post('/api/folders', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const folderData = req.body;
+      const folder = await storage.createDrawingFolder(folderData);
+      res.status(201).json(folder);
+    } catch (error) {
+      console.error('Error creating folder:', error);
+      res.status(500).json({ message: 'Failed to create folder' });
+    }
+  });
+
+  app.put('/api/folders/:id', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const folderId = parseInt(req.params.id);
+      const folderData = req.body;
+      const folder = await storage.updateDrawingFolder(folderId, folderData);
+      
+      if (!folder) {
+        return res.status(404).json({ message: 'Folder not found' });
+      }
+      
+      res.json(folder);
+    } catch (error) {
+      console.error('Error updating folder:', error);
+      res.status(500).json({ message: 'Failed to update folder' });
+    }
+  });
+
+  app.delete('/api/folders/:id', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const folderId = parseInt(req.params.id);
+      const success = await storage.deleteDrawingFolder(folderId);
+      
+      if (!success) {
+        return res.status(404).json({ message: 'Folder not found' });
+      }
+      
+      res.json({ message: 'Folder deleted successfully' });
+    } catch (error) {
+      console.error('Error deleting folder:', error);
+      res.status(500).json({ message: 'Failed to delete folder' });
+    }
+  });
+
+  // Revision Sets
+  app.get('/api/revision-sets', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const { projectId } = req.query;
+      const revisionSets = await storage.getRevisionSets(projectId ? parseInt(projectId) : undefined);
+      res.json(revisionSets);
+    } catch (error) {
+      console.error('Error fetching revision sets:', error);
+      res.status(500).json({ message: 'Failed to fetch revision sets' });
+    }
+  });
+
+  app.post('/api/revision-sets', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const revisionSetData = req.body;
+      const revisionSet = await storage.createRevisionSet(revisionSetData);
+      res.status(201).json(revisionSet);
+    } catch (error) {
+      console.error('Error creating revision set:', error);
+      res.status(500).json({ message: 'Failed to create revision set' });
+    }
+  });
+
+  // Content Mappings
+  app.get('/api/content-mappings/:revisionSetId', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const revisionSetId = parseInt(req.params.revisionSetId);
+      const mappings = await storage.getContentMappings(revisionSetId);
+      res.json(mappings);
+    } catch (error) {
+      console.error('Error fetching content mappings:', error);
+      res.status(500).json({ message: 'Failed to fetch content mappings' });
+    }
+  });
+
+  app.post('/api/content-mappings', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const mappingData = req.body;
+      const mapping = await storage.createContentMapping(mappingData);
+      res.status(201).json(mapping);
+    } catch (error) {
+      console.error('Error creating content mapping:', error);
+      res.status(500).json({ message: 'Failed to create content mapping' });
+    }
+  });
+
+  // Revision Changes
+  app.get('/api/revision-changes/:revisionSetId', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const revisionSetId = parseInt(req.params.revisionSetId);
+      const changes = await storage.getRevisionChanges(revisionSetId);
+      res.json(changes);
+    } catch (error) {
+      console.error('Error fetching revision changes:', error);
+      res.status(500).json({ message: 'Failed to fetch revision changes' });
+    }
+  });
+
+  app.post('/api/revision-changes', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const changeData = req.body;
+      const change = await storage.createRevisionChange(changeData);
+      res.status(201).json(change);
+    } catch (error) {
+      console.error('Error creating revision change:', error);
+      res.status(500).json({ message: 'Failed to create revision change' });
+    }
+  });
+
+  app.put('/api/revision-changes/:id/review', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const changeId = parseInt(req.params.id);
+      const change = await storage.markChangeAsReviewed(changeId, req.user.id);
+      
+      if (!change) {
+        return res.status(404).json({ message: 'Revision change not found' });
+      }
+      
+      res.json(change);
+    } catch (error) {
+      console.error('Error reviewing revision change:', error);
+      res.status(500).json({ message: 'Failed to review revision change' });
+    }
+  });
+
+  // AI-Powered Drawing Comparison
+  app.post('/api/drawings/compare', async (req: any, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    try {
+      const { originalDrawingId, newDrawingId } = req.body;
+      
+      if (!originalDrawingId || !newDrawingId) {
+        return res.status(400).json({ message: 'Both originalDrawingId and newDrawingId are required' });
+      }
+
+      // Check user's AI credit balance
+      const creditBalance = await AiCreditService.checkCreditBalance(req.user.id);
+      if (creditBalance < 2) { // Minimum credits needed for comparison
+        return res.status(402).json({ 
+          message: 'Insufficient AI credits for drawing comparison',
+          requiredCredits: 2,
+          currentBalance: creditBalance
+        });
+      }
+
+      console.log(`Starting AI drawing comparison for user ${req.user.id}: drawings ${originalDrawingId} vs ${newDrawingId}`);
+
+      const comparison = await revisionComparisonService.compareDrawingSets(
+        parseInt(originalDrawingId),
+        parseInt(newDrawingId),
+        req.user.id
+      );
+
+      res.json({
+        success: true,
+        comparison: comparison,
+        message: `Found ${comparison.summary.totalChanges} changes, preserved ${comparison.preservedExtractions.length} extractions`
+      });
+
+    } catch (error) {
+      console.error('Error comparing drawings:', error);
+      res.status(500).json({ 
+        message: 'Failed to compare drawings',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  });
+
+  // Test SMS endpoint for debugging
+  app.post('/api/test-sms', async (req, res) => {
+    try {
+      const { phoneNumber } = req.body;
+      if (!phoneNumber) {
+        return res.status(400).json({ error: 'Phone number is required' });
+      }
+
+      const testCode = '123456';
+      const success = await sendSMSVerificationCode(phoneNumber, testCode);
+      
+      res.json({ 
+        success, 
+        message: success ? 'Test SMS sent successfully' : 'Failed to send test SMS',
+        phoneNumber,
+        testCode 
+      });
+    } catch (error: any) {
+      console.error('SMS test failed:', error);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+
+  // Test email endpoint for debugging
+  app.post('/api/test-email', async (req, res) => {
+    try {
+      const { email } = req.body;
+      if (!email) {
+        return res.status(400).json({ error: 'Email is required' });
+      }
+
+      const testCode = '123456';
+      const success = await sendEmailVerificationCode(email, testCode);
+      
+      res.json({ 
+        success, 
+        message: success ? 'Test email sent successfully' : 'Failed to send test email',
+        email,
+        testCode 
+      });
+    } catch (error: any) {
+      console.error('Email test failed:', error);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+
+  // Clear template cache endpoint
+  app.post('/api/clear-cache', async (req, res) => {
+    try {
+      res.json({ 
+        success: true, 
+        message: 'Cache clearing initiated. Please refresh your browser and clear localStorage.' 
+      });
+    } catch (error: any) {
+      console.error('Cache clear failed:', error);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  return httpServer;
+}

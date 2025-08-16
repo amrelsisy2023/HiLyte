@@ -1,0 +1,558 @@
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ArchAnnotate Pro - Construction Drawing Annotation Tool</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+    tailwind.config = {
+        theme: {
+            extend: {
+                colors: {
+                    'construction-orange': '#FF9800',
+                    'electrical-red': '#E53E3E',
+                    'plumbing-blue': '#3182CE',
+                    'lighting-yellow': '#D69E2E',
+                    'hvac-green': '#38A169'
+                }
+            }
+        }
+    };
+    </script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .canvas-container { position: relative; overflow: hidden; }
+        .annotation-canvas { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 10; }
+        .active-tool { pointer-events: auto; }
+        .drawing-image { max-width: 100%; height: auto; display: block; }
+        .toolbar-floating { backdrop-filter: blur(10px); background: rgba(255, 255, 255, 0.9); }
+        .sidebar-overlay { backdrop-filter: blur(4px); }
+    </style>
+</head>
+<body class="bg-gray-50 font-sans">
+    <!-- @COMPONENT: AppHeader -->
+    <header class="bg-white shadow-sm border-b border-gray-200 sticky top-0 z-50">
+        <div class="px-6 py-4">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-4">
+                    <div class="flex items-center space-x-2">
+                        <i class="fas fa-drafting-compass text-blue-600 text-xl"></i>
+                        <h1 class="text-xl font-bold text-gray-900">ArchAnnotate Pro</h1>
+                    </div>
+                    <div class="hidden md:flex items-center space-x-1 text-sm text-gray-600">
+                        <span data-bind="currentProject.name" data-mock="true">Downtown Office Complex</span>
+                        <i class="fas fa-chevron-right text-xs"></i>
+                        <span data-bind="currentDrawing.name" data-mock="true">Floor Plan - Level 2</span>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-3">
+                    <button class="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
+                        <i class="fas fa-save"></i>
+                        <span>Save Annotations</span>
+                    </button>
+                    <button class="flex items-center space-x-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors">
+                        <i class="fas fa-share-alt"></i>
+                        <span>Share</span>
+                    </button>
+                    <div class="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center">
+                        <span class="text-white font-medium text-sm" data-bind="user.initials" data-mock="true">JD</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+    <!-- @END_COMPONENT: AppHeader -->
+
+    <div class="flex h-screen pt-16">
+        <!-- @COMPONENT: ProjectSidebar -->
+        <aside class="w-80 bg-white shadow-sm border-r border-gray-200 flex flex-col">
+            <!-- Project Navigation -->
+            <div class="p-4 border-b border-gray-200">
+                <h2 class="text-lg font-semibold text-gray-900 mb-3">Project Drawings</h2>
+                <button class="w-full flex items-center justify-center space-x-2 p-3 border-2 border-dashed border-gray-300 rounded-lg hover:border-blue-400 hover:bg-blue-50 transition-colors group">
+                    <i class="fas fa-cloud-upload-alt text-gray-400 group-hover:text-blue-500"></i>
+                    <span class="text-gray-600 group-hover:text-blue-600 font-medium">Upload New Drawing</span>
+                </button>
+            </div>
+
+            <!-- Drawings List -->
+            <div class="flex-1 overflow-y-auto p-4 space-y-2">
+                <!-- @MAP: projectDrawings.map(drawing => ( -->
+                <div class="p-3 bg-blue-50 border border-blue-200 rounded-lg cursor-pointer hover:bg-blue-100 transition-colors" data-mock="true">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center space-x-3">
+                            <i class="fas fa-file-image text-blue-600"></i>
+                            <div>
+                                <h3 class="font-medium text-gray-900">Floor Plan - Level 2</h3>
+                                <p class="text-sm text-gray-600">Last modified: 2 hours ago</p>
+                            </div>
+                        </div>
+                        <div class="flex items-center space-x-1">
+                            <span class="w-2 h-2 bg-electrical-red rounded-full"></span>
+                            <span class="w-2 h-2 bg-plumbing-blue rounded-full"></span>
+                            <span class="w-2 h-2 bg-lighting-yellow rounded-full"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="p-3 border border-gray-200 rounded-lg cursor-pointer hover:bg-gray-50 transition-colors" data-mock="true">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center space-x-3">
+                            <i class="fas fa-file-image text-gray-400"></i>
+                            <div>
+                                <h3 class="font-medium text-gray-900">Electrical Layout</h3>
+                                <p class="text-sm text-gray-600">Last modified: 1 day ago</p>
+                            </div>
+                        </div>
+                        <div class="flex items-center space-x-1">
+                            <span class="w-2 h-2 bg-electrical-red rounded-full"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="p-3 border border-gray-200 rounded-lg cursor-pointer hover:bg-gray-50 transition-colors" data-mock="true">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center space-x-3">
+                            <i class="fas fa-file-image text-gray-400"></i>
+                            <div>
+                                <h3 class="font-medium text-gray-900">Plumbing Schematic</h3>
+                                <p class="text-sm text-gray-600">Last modified: 3 days ago</p>
+                            </div>
+                        </div>
+                        <div class="flex items-center space-x-1">
+                            <span class="w-2 h-2 bg-plumbing-blue rounded-full"></span>
+                        </div>
+                    </div>
+                </div>
+                <!-- @END_MAP -->
+            </div>
+
+            <!-- Construction Divisions Panel -->
+            <div class="border-t border-gray-200 p-4">
+                <h3 class="text-sm font-semibold text-gray-900 mb-3">Construction Divisions</h3>
+                <div class="space-y-2">
+                    <!-- @MAP: constructionDivisions.map(division => ( -->
+                    <div class="flex items-center justify-between p-2 rounded-lg hover:bg-gray-50 transition-colors" data-mock="true">
+                        <div class="flex items-center space-x-2">
+                            <div class="w-4 h-4 bg-electrical-red rounded-full"></div>
+                            <span class="text-sm font-medium text-gray-900">Electrical</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <span class="text-xs text-gray-500" data-bind="division.annotationCount" data-mock="true">12</span>
+                            <button class="text-gray-400 hover:text-gray-600">
+                                <i class="fas fa-eye text-xs"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="flex items-center justify-between p-2 rounded-lg hover:bg-gray-50 transition-colors" data-mock="true">
+                        <div class="flex items-center space-x-2">
+                            <div class="w-4 h-4 bg-plumbing-blue rounded-full"></div>
+                            <span class="text-sm font-medium text-gray-900">Plumbing</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <span class="text-xs text-gray-500" data-bind="division.annotationCount" data-mock="true">8</span>
+                            <button class="text-gray-400 hover:text-gray-600">
+                                <i class="fas fa-eye text-xs"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="flex items-center justify-between p-2 rounded-lg hover:bg-gray-50 transition-colors" data-mock="true">
+                        <div class="flex items-center space-x-2">
+                            <div class="w-4 h-4 bg-lighting-yellow rounded-full"></div>
+                            <span class="text-sm font-medium text-gray-900">Lighting</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <span class="text-xs text-gray-500" data-bind="division.annotationCount" data-mock="true">6</span>
+                            <button class="text-gray-400 hover:text-gray-600">
+                                <i class="fas fa-eye text-xs"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="flex items-center justify-between p-2 rounded-lg hover:bg-gray-50 transition-colors" data-mock="true">
+                        <div class="flex items-center space-x-2">
+                            <div class="w-4 h-4 bg-hvac-green rounded-full"></div>
+                            <span class="text-sm font-medium text-gray-900">HVAC</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <span class="text-xs text-gray-500" data-bind="division.annotationCount" data-mock="true">4</span>
+                            <button class="text-gray-400 hover:text-gray-600">
+                                <i class="fas fa-eye text-xs"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <!-- @END_MAP -->
+                </div>
+            </div>
+        </aside>
+        <!-- @END_COMPONENT: ProjectSidebar -->
+
+        <!-- @COMPONENT: MainCanvas -->
+        <main class="flex-1 flex flex-col bg-gray-100">
+            <!-- Drawing Upload State -->
+            <div class="flex-1 flex items-center justify-center p-8" id="uploadState">
+                <div class="max-w-md w-full">
+                    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-8 text-center">
+                        <div class="w-20 h-20 bg-blue-50 rounded-full flex items-center justify-center mx-auto mb-4">
+                            <i class="fas fa-cloud-upload-alt text-blue-600 text-2xl"></i>
+                        </div>
+                        <h3 class="text-lg font-semibold text-gray-900 mb-2">Upload Architectural Drawing</h3>
+                        <p class="text-gray-600 mb-6">Drag and drop your PDF, PNG, or JPG files here, or click to browse</p>
+                        <div class="border-2 border-dashed border-gray-300 rounded-lg p-8 hover:border-blue-400 hover:bg-blue-50 transition-colors cursor-pointer">
+                            <input type="file" accept=".pdf,.png,.jpg,.jpeg" class="hidden" id="fileInput" data-implementation="Handle file upload and preview">
+                            <div class="text-center">
+                                <i class="fas fa-file-upload text-gray-400 text-3xl mb-2"></i>
+                                <p class="text-gray-600">Choose files or drag and drop</p>
+                                <p class="text-sm text-gray-500 mt-1">PDF, PNG, JPG up to 50MB</p>
+                            </div>
+                        </div>
+                        <div class="mt-6 flex justify-center space-x-4">
+                            <button class="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
+                                Browse Files
+                            </button>
+                            <button class="px-6 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors">
+                                Load Sample
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Drawing Canvas Area (Hidden initially) -->
+            <div class="flex-1 relative hidden" id="canvasArea">
+                <!-- Floating Toolbar -->
+                <div class="absolute top-4 left-4 z-30 toolbar-floating rounded-lg shadow-lg border border-gray-200 p-3">
+                    <div class="flex items-center space-x-2">
+                        <!-- Zoom Controls -->
+                        <div class="flex items-center space-x-1 pr-2 border-r border-gray-300">
+                            <button class="w-8 h-8 flex items-center justify-center rounded hover:bg-gray-100 transition-colors" data-event="click:zoomOut">
+                                <i class="fas fa-minus text-sm"></i>
+                            </button>
+                            <span class="text-sm font-medium text-gray-700 px-2" data-bind="currentZoom" data-mock="true">100%</span>
+                            <button class="w-8 h-8 flex items-center justify-center rounded hover:bg-gray-100 transition-colors" data-event="click:zoomIn">
+                                <i class="fas fa-plus text-sm"></i>
+                            </button>
+                        </div>
+
+                        <!-- Annotation Tools -->
+                        <div class="flex items-center space-x-1 px-2 border-r border-gray-300">
+                            <button class="w-8 h-8 flex items-center justify-center rounded hover:bg-gray-100 transition-colors" data-event="click:selectPanTool" title="Pan Tool">
+                                <i class="fas fa-hand-paper text-sm"></i>
+                            </button>
+                            <button class="w-8 h-8 flex items-center justify-center rounded bg-blue-100 text-blue-600 transition-colors" data-event="click:selectHighlightTool" title="Highlight Tool">
+                                <i class="fas fa-highlighter text-sm"></i>
+                            </button>
+                            <button class="w-8 h-8 flex items-center justify-center rounded hover:bg-gray-100 transition-colors" data-event="click:selectRectangleTool" title="Rectangle Tool">
+                                <i class="fas fa-square text-sm"></i>
+                            </button>
+                            <button class="w-8 h-8 flex items-center justify-center rounded hover:bg-gray-100 transition-colors" data-event="click:selectCircleTool" title="Circle Tool">
+                                <i class="fas fa-circle text-sm"></i>
+                            </button>
+                        </div>
+
+                        <!-- Color Picker -->
+                        <div class="flex items-center space-x-1 px-2">
+                            <button class="w-6 h-6 rounded bg-electrical-red border-2 border-white shadow-sm hover:scale-110 transition-transform" data-event="click:selectColor" data-color="electrical" title="Electrical"></button>
+                            <button class="w-6 h-6 rounded bg-plumbing-blue border-2 border-gray-300 shadow-sm hover:scale-110 transition-transform" data-event="click:selectColor" data-color="plumbing" title="Plumbing"></button>
+                            <button class="w-6 h-6 rounded bg-lighting-yellow border-2 border-gray-300 shadow-sm hover:scale-110 transition-transform" data-event="click:selectColor" data-color="lighting" title="Lighting"></button>
+                            <button class="w-6 h-6 rounded bg-hvac-green border-2 border-gray-300 shadow-sm hover:scale-110 transition-transform" data-event="click:selectColor" data-color="hvac" title="HVAC"></button>
+                        </div>
+
+                        <!-- Undo/Redo -->
+                        <div class="flex items-center space-x-1 pl-2 border-l border-gray-300">
+                            <button class="w-8 h-8 flex items-center justify-center rounded hover:bg-gray-100 transition-colors" data-event="click:undo" title="Undo">
+                                <i class="fas fa-undo text-sm"></i>
+                            </button>
+                            <button class="w-8 h-8 flex items-center justify-center rounded hover:bg-gray-100 transition-colors" data-event="click:redo" title="Redo">
+                                <i class="fas fa-redo text-sm"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Canvas Container -->
+                <div class="w-full h-full canvas-container bg-white">
+                    <!-- Architectural Drawing -->
+                    <!-- A detailed architectural floor plan showing office layout with rooms, doors, and windows -->
+                    <img src="https://images.unsplash.com/photo-1503387762-592deb58ef4e?ixlib=rb-4.0.3&ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&auto=format&fit=crop&w=1200&h=800" 
+                         alt="Architectural floor plan" 
+                         class="drawing-image" 
+                         data-mock-image="true" 
+                         data-implementation="Replace with uploaded architectural drawing">
+                    
+                    <!-- Annotation Canvas Layer -->
+                    <canvas class="annotation-canvas active-tool" 
+                            data-implementation="Canvas for drawing annotations and highlights"
+                            data-functionality="This should implement free-hand drawing and shape tools for highlighting areas">
+                    </canvas>
+                </div>
+
+                <!-- Drawing Info Panel -->
+                <div class="absolute bottom-4 right-4 bg-white rounded-lg shadow-lg border border-gray-200 p-3 toolbar-floating">
+                    <div class="text-sm">
+                        <div class="flex items-center space-x-4">
+                            <div class="flex items-center space-x-2">
+                                <i class="fas fa-ruler text-gray-400"></i>
+                                <span class="text-gray-600">Scale: 1:100</span>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                <i class="fas fa-expand-arrows-alt text-gray-400"></i>
+                                <span class="text-gray-600" data-bind="drawingDimensions" data-mock="true">2400x1800px</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+        <!-- @END_COMPONENT: MainCanvas -->
+    </div>
+
+    <!-- @COMPONENT: AnnotationModal -->
+    <div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden sidebar-overlay" id="annotationModal">
+        <div class="bg-white rounded-xl shadow-xl max-w-md w-full mx-4">
+            <div class="p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-lg font-semibold text-gray-900">Annotation Details</h3>
+                    <button class="text-gray-400 hover:text-gray-600" data-event="click:closeModal">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Construction Division</label>
+                        <select class="w-full p-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                            <option>Electrical</option>
+                            <option>Plumbing</option>
+                            <option>Lighting</option>
+                            <option>HVAC</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Notes</label>
+                        <textarea class="w-full p-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500" rows="3" placeholder="Add notes about this annotation..."></textarea>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Priority</label>
+                        <div class="flex space-x-2">
+                            <button class="px-3 py-1 text-sm bg-green-100 text-green-700 rounded-lg hover:bg-green-200 transition-colors">Low</button>
+                            <button class="px-3 py-1 text-sm bg-yellow-100 text-yellow-700 rounded-lg hover:bg-yellow-200 transition-colors">Medium</button>
+                            <button class="px-3 py-1 text-sm bg-red-100 text-red-700 rounded-lg hover:bg-red-200 transition-colors">High</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="flex justify-end space-x-3 mt-6">
+                    <button class="px-4 py-2 text-gray-600 hover:text-gray-800 transition-colors" data-event="click:closeModal">Cancel</button>
+                    <button class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">Save Annotation</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <!-- @END_COMPONENT: AnnotationModal -->
+
+    <!-- @COMPONENT: LoadingOverlay -->
+    <div class="fixed inset-0 bg-white bg-opacity-90 flex items-center justify-center z-50 hidden" id="loadingOverlay">
+        <div class="text-center">
+            <div class="w-16 h-16 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin mx-auto mb-4"></div>
+            <p class="text-gray-600 font-medium">Processing your drawing...</p>
+            <p class="text-sm text-gray-500">This may take a few moments for large files</p>
+        </div>
+    </div>
+    <!-- @END_COMPONENT: LoadingOverlay -->
+
+    <script>
+        // TODO: Implement file upload functionality
+        // TODO: Implement canvas drawing and annotation system
+        // TODO: Implement zoom and pan functionality
+        // TODO: Implement annotation saving and loading
+        // TODO: Implement project management features
+        
+        (function() {
+            'use strict';
+            
+            // Mock state management
+            let currentTool = 'highlight';
+            let currentColor = 'electrical';
+            let currentZoom = 100;
+            
+            // Initialize the application
+            function initApp() {
+                setupEventListeners();
+                setupFileUpload();
+                setupCanvasInteraction();
+            }
+            
+            function setupEventListeners() {
+                // File input change
+                const fileInput = document.getElementById('fileInput');
+                if (fileInput) {
+                    fileInput.addEventListener('change', handleFileUpload);
+                }
+                
+                // Tool selection
+                document.addEventListener('click', function(e) {
+                    const tool = e.target.closest('[data-event]');
+                    if (tool) {
+                        const event = tool.dataset.event;
+                        handleToolAction(event, tool);
+                    }
+                });
+            }
+            
+            function setupFileUpload() {
+                const uploadArea = document.querySelector('#uploadState');
+                if (!uploadArea) return;
+                
+                // Drag and drop functionality
+                uploadArea.addEventListener('dragover', function(e) {
+                    e.preventDefault();
+                    uploadArea.classList.add('drag-over');
+                });
+                
+                uploadArea.addEventListener('dragleave', function(e) {
+                    e.preventDefault();
+                    uploadArea.classList.remove('drag-over');
+                });
+                
+                uploadArea.addEventListener('drop', function(e) {
+                    e.preventDefault();
+                    uploadArea.classList.remove('drag-over');
+                    const files = e.dataTransfer.files;
+                    if (files.length > 0) {
+                        handleFileUpload({ target: { files: files } });
+                    }
+                });
+            }
+            
+            function setupCanvasInteraction() {
+                // Canvas mouse events for drawing
+                const canvas = document.querySelector('.annotation-canvas');
+                if (!canvas) return;
+                
+                let isDrawing = false;
+                let lastX = 0;
+                let lastY = 0;
+                
+                canvas.addEventListener('mousedown', function(e) {
+                    if (currentTool === 'highlight') {
+                        isDrawing = true;
+                        [lastX, lastY] = [e.offsetX, e.offsetY];
+                    }
+                });
+                
+                canvas.addEventListener('mousemove', function(e) {
+                    if (!isDrawing) return;
+                    // Drawing logic would go here
+                });
+                
+                canvas.addEventListener('mouseup', function() {
+                    isDrawing = false;
+                });
+            }
+            
+            function handleFileUpload(event) {
+                const files = event.target.files;
+                if (files.length === 0) return;
+                
+                const file = files[0];
+                const validTypes = ['image/png', 'image/jpeg', 'image/jpg', 'application/pdf'];
+                
+                if (!validTypes.includes(file.type)) {
+                    alert('Please upload a valid file (PDF, PNG, or JPG)');
+                    return;
+                }
+                
+                // Show loading overlay
+                document.getElementById('loadingOverlay').classList.remove('hidden');
+                
+                // Simulate file processing
+                setTimeout(() => {
+                    document.getElementById('loadingOverlay').classList.add('hidden');
+                    document.getElementById('uploadState').classList.add('hidden');
+                    document.getElementById('canvasArea').classList.remove('hidden');
+                }, 2000);
+            }
+            
+            function handleToolAction(event, element) {
+                const [action, handler] = event.split(':');
+                
+                switch (handler) {
+                    case 'zoomIn':
+                        currentZoom = Math.min(currentZoom + 25, 500);
+                        updateZoomDisplay();
+                        break;
+                    case 'zoomOut':
+                        currentZoom = Math.max(currentZoom - 25, 25);
+                        updateZoomDisplay();
+                        break;
+                    case 'selectPanTool':
+                    case 'selectHighlightTool':
+                    case 'selectRectangleTool':
+                    case 'selectCircleTool':
+                        updateToolSelection(handler);
+                        break;
+                    case 'selectColor':
+                        currentColor = element.dataset.color;
+                        updateColorSelection(element);
+                        break;
+                    case 'undo':
+                    case 'redo':
+                        // Annotation history logic
+                        break;
+                    case 'closeModal':
+                        document.getElementById('annotationModal').classList.add('hidden');
+                        break;
+                    default:
+                        console.log('Unhandled action:', handler);
+                }
+            }
+            
+            function updateZoomDisplay() {
+                const zoomDisplay = document.querySelector('[data-bind="currentZoom"]');
+                if (zoomDisplay) {
+                    zoomDisplay.textContent = currentZoom + '%';
+                }
+            }
+            
+            function updateToolSelection(tool) {
+                // Remove active state from all tools
+                document.querySelectorAll('[data-event*="selectTool"]').forEach(btn => {
+                    btn.classList.remove('bg-blue-100', 'text-blue-600');
+                    btn.classList.add('hover:bg-gray-100');
+                });
+                
+                // Add active state to selected tool
+                const selectedTool = document.querySelector(`[data-event*="${tool}"]`);
+                if (selectedTool) {
+                    selectedTool.classList.add('bg-blue-100', 'text-blue-600');
+                    selectedTool.classList.remove('hover:bg-gray-100');
+                }
+                
+                currentTool = tool.replace('select', '').replace('Tool', '').toLowerCase();
+            }
+            
+            function updateColorSelection(selectedElement) {
+                // Remove active border from all color buttons
+                document.querySelectorAll('[data-event*="selectColor"]').forEach(btn => {
+                    btn.classList.remove('border-white');
+                    btn.classList.add('border-gray-300');
+                });
+                
+                // Add active border to selected color
+                selectedElement.classList.add('border-white');
+                selectedElement.classList.remove('border-gray-300');
+            }
+            
+            // Initialize when DOM is ready
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', initApp);
+            } else {
+                initApp();
+            }
+        })();
+    </script>
+</body>
+</html>
